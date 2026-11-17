@@ -5,6 +5,7 @@ import FreeReadingCore
 @main
 struct FreeReadingApp: App {
     @StateObject private var bootstrap = AppBootstrap()
+    @Environment(\.scenePhase) private var scenePhase
 
     var body: some Scene {
         WindowGroup {
@@ -24,6 +25,9 @@ struct FreeReadingApp: App {
             .tint(LibraryTheme.forest)
             .task { bootstrap.prepare() }
             .onOpenURL { bootstrap.open($0) }
+            .onChange(of: scenePhase) { _, phase in
+                if phase == .active { bootstrap.store?.consumeShareInbox() }
+            }
         }
     }
 }

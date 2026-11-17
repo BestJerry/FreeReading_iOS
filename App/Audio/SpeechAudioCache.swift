@@ -1,14 +1,19 @@
 import AVFoundation
 import CryptoKit
 import Foundation
+import FreeReadingCore
 
-/// 按句生成 CAF 并复用缓存；调用方串行调度合成，取消旧请求后才可以开始新请求。
+/// 按句生成 CAF 并复用缓存；播放与预取共用串行单飞队列，同一句的在途结果只合成一次。
 @MainActor
 final class SpeechAudioCache {
     private let root: URL
-    private var active: SpeechSynthesisJob?
+    private let preparation = SpeechPreparationQueue<String, CachedSpeechClip>()
     private var protectedURLs = Set<URL>()
+    private var validatedVoices = Set<String>()
+    private var catalogGeneration: UInt64 = 0
     private let capacity = 256 * 1_024 * 1_024
+    private var knownBytes: Int?
+    private var cacheMutation: UInt64 = 0
 
     init() {
         let base = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask).first!
@@ -20,17 +25,51 @@ final class SpeechAudioCache {
 
     /// 只列出系统提供的同语言声音，不请求用户的个人声音授权。
     func voices(language: String) -> [AVSpeechSynthesisVoice] {
-        let key = Self.languageKey(language)
+        var seen = Set<String>()
         return AVSpeechSynthesisVoice.speechVoices()
-            .filter { Self.languageKey($0.language) == key && !$0.voiceTraits.contains(.isPersonalVoice) }
+            .filter { SpeechLanguagePolicy.matchRank(candidate: $0.language, requested: language) >= 0 && !$0.voiceTraits.contains(.isPersonalVoice) }
             .filter { AVSpeechSynthesisVoice(identifier: $0.identifier) != nil }
             .sorted {
-                let leftExact = $0.language.lowercased() == language.replacingOccurrences(of: "_", with: "-").lowercased()
-                let rightExact = $1.language.lowercased() == language.replacingOccurrences(of: "_", with: "-").lowercased()
-                if leftExact != rightExact { return leftExact }
+                let left = SpeechLanguagePolicy.matchRank(candidate: $0.language, requested: language)
+                let right = SpeechLanguagePolicy.matchRank(candidate: $1.language, requested: language)
+                if left != right { return left > right }
                 if $0.quality.rawValue != $1.quality.rawValue { return $0.quality.rawValue > $1.quality.rawValue }
                 return $0.identifier < $1.identifier
             }
+            .filter { seen.insert($0.identifier).inserted }
+    }
+
+    /// 重新从系统取目录；验证结果只在当前进程有效，用户刷新后必须重新合成校验。
+    func refreshVoices(language: String) -> [AVSpeechSynthesisVoice] {
+        catalogGeneration &+= 1
+        validatedVoices.removeAll()
+        _ = selectedID(language: language)
+        return voices(language: language)
+    }
+
+    func isValidated(voiceID: String) -> Bool { validatedVoices.contains(voiceID) }
+
+    /// 使用独立且不出声的写文件任务验证当前声音，既不命中旧缓存，也不取消听书队列。
+    /// iOS 没有逐声音的网络依赖标志，成功只代表此刻能合成，不标记“离线已验证”。
+    func validateVoice(id: String, language: String) async throws {
+        guard let voice = voices(language: language).first(where: { $0.identifier == id }) else { throw SpeechPlaybackError.noVoice(language) }
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        let temporary = root.appendingPathComponent(UUID().uuidString).appendingPathExtension("validation.partial.caf")
+        let job = SpeechSynthesisJob(url: temporary)
+        let generation = catalogGeneration
+        defer { try? FileManager.default.removeItem(at: temporary) }
+        do {
+            let phrase = Self.languageKey(language) == "zh" ? "阅读，让世界更辽阔。" : "Free Reading."
+            try await job.run(text: phrase, voice: voice)
+            try Task.checkCancellation()
+            _ = try readClip(temporary)
+            guard generation == catalogGeneration else { throw CancellationError() }
+            validatedVoices.insert(id)
+        } catch {
+            job.cancel()
+            if generation == catalogGeneration { validatedVoices.remove(id) }
+            throw error
+        }
     }
 
     func selectedID(language: String) -> String? {
@@ -59,58 +98,81 @@ final class SpeechAudioCache {
         return voice
     }
 
+    /// 已完成的 CAF 可同步接续播放，不先进入“准备中”；未完成的预取由 ensure 接管。
+    func cachedClip(bookID: String, text: String, voice: AVSpeechSynthesisVoice) -> CachedSpeechClip? {
+        let final = clipURL(bookID: bookID, text: text, voice: voice)
+        guard let clip = try? readClip(final) else { return nil }
+        try? FileManager.default.setAttributes([.modificationDate: Date()], ofItemAtPath: final.path)
+        return clip
+    }
+
     /// 缓存键隔离系统版本、声音及文本；倍速在播放器端处理，合成始终使用系统默认语速。
-    func ensure(bookID: String, text: String, voice: AVSpeechSynthesisVoice) async throws -> CachedSpeechClip {
+    func ensure(bookID: String, text: String, voice: AVSpeechSynthesisVoice,
+                priority: SpeechPreparationPriority = .playback) async throws -> CachedSpeechClip {
         try Task.checkCancellation()
         guard !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { throw SpeechPlaybackError.emptyText }
+        if let clip = cachedClip(bookID: bookID, text: text, voice: voice) { return clip }
+        let final = clipURL(bookID: bookID, text: text, voice: voice)
+        return try await preparation.value(for: final.path, priority: priority) { [self] in
+            // 请求排队期间文件可能已由上一代完成；此时同样无需再启动合成器。
+            if let clip = cachedClip(bookID: bookID, text: text, voice: voice) { return clip }
+            return try await synthesize(text: text, voice: voice, final: final)
+        }
+    }
+
+    private func clipURL(bookID: String, text: String, voice: AVSpeechSynthesisVoice) -> URL {
         let voiceKey = "\(ProcessInfo.processInfo.operatingSystemVersionString)|\(voice.identifier)|rate=default|\(text)"
         let key = SHA256.hash(data: Data(voiceKey.utf8)).map { String(format: "%02x", $0) }.joined()
         // bookID 在书库中由 SHA-256 生成，这里仍使用哈希作为目录名，避免任意路径参与拼接。
         let safeBookID = SHA256.hash(data: Data(bookID.utf8)).map { String(format: "%02x", $0) }.joined()
-        let directory = root.appendingPathComponent(safeBookID, isDirectory: true)
+        return root.appendingPathComponent(safeBookID, isDirectory: true).appendingPathComponent(key).appendingPathExtension("caf")
+    }
+
+    private func synthesize(text: String, voice: AVSpeechSynthesisVoice, final: URL) async throws -> CachedSpeechClip {
+        try Task.checkCancellation()
+        let directory = final.deletingLastPathComponent()
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         // 用户首次解锁后，锁屏中的后台音频仍需读取和预取该目录。
         try? FileManager.default.setAttributes([.protectionKey: FileProtectionType.completeUntilFirstUserAuthentication], ofItemAtPath: directory.path)
-        let final = directory.appendingPathComponent(key).appendingPathExtension("caf")
-        if let clip = try? readClip(final) {
-            try? FileManager.default.setAttributes([.modificationDate: Date()], ofItemAtPath: final.path)
-            return clip
+        if FileManager.default.fileExists(atPath: final.path) {
+            try? FileManager.default.removeItem(at: final)
+            knownBytes = nil; cacheMutation &+= 1
         }
-        try? FileManager.default.removeItem(at: final)
-        // 每代操作都会先 cancel；若调用者违反串行约定，不让两个合成器竞争同一队列。
-        guard active == nil else { throw SpeechPlaybackError.synthesisFailed }
         let temporary = directory.appendingPathComponent(UUID().uuidString).appendingPathExtension("partial.caf")
         let job = SpeechSynthesisJob(url: temporary)
-        active = job
         defer {
-            if active === job { active = nil }
             try? FileManager.default.removeItem(at: temporary)
         }
         do {
             try await job.run(text: text, voice: voice)
             try Task.checkCancellation()
-            _ = try readClip(temporary)
+            let clip = try readClip(temporary)
+            let bytes = try temporary.resourceValues(forKeys: [.fileSizeKey]).fileSize ?? 0
+            try await trim(keeping: final, adding: bytes)
+            try Task.checkCancellation()
+            // 先完成容量核对再发布最终路径，cachedClip 不会把尚未回收完成的文件交给播放器。
             try FileManager.default.moveItem(at: temporary, to: final)
-            let clip = try readClip(final)
-            try trim(keeping: final)
-            return clip
+            validatedVoices.insert(voice.identifier)
+            return CachedSpeechClip(url: final, duration: clip.duration)
         } catch {
+            knownBytes = nil
             job.cancel()
             throw error
         }
     }
 
-    /// 旧合成器独立持有自己的回调，停止它不会中断随后创建的新合成器。
+    /// 明确改变播放目标时取消队列；自然换句应复用预取，不调用此方法。
     func cancel() {
-        let old = active
-        active = nil
-        old?.cancel()
+        preparation.cancelAll()
     }
 
     /// 移除书籍时回收对应缓存；失败的文件仍可由后续容量回收再次处理。
     func remove(bookID: String) {
         let safeID = SHA256.hash(data: Data(bookID.utf8)).map { String(format: "%02x", $0) }.joined()
-        try? FileManager.default.removeItem(at: root.appendingPathComponent(safeID, isDirectory: true))
+        let directory = root.appendingPathComponent(safeID, isDirectory: true)
+        preparation.cancel { $0.hasPrefix(directory.path + "/") }
+        try? FileManager.default.removeItem(at: directory)
+        knownBytes = nil; cacheMutation &+= 1
     }
 
     private func readClip(_ url: URL) throws -> CachedSpeechClip {
@@ -120,29 +182,56 @@ final class SpeechAudioCache {
         return CachedSpeechClip(url: url, duration: duration)
     }
 
-    /// 按最近使用时间回收未保护的音频；删除失败时保留实际大小判断，不承诺成功回收。
-    private func trim(keeping keep: URL) throws {
-        guard let enumerator = FileManager.default.enumerator(at: root, includingPropertiesForKeys: [.fileSizeKey, .contentModificationDateKey], options: [.skipsHiddenFiles]) else { return }
-        var files: [(URL, Int, Date)] = []
-        for case let url as URL in enumerator where url.pathExtension == "caf" {
-            let values = try url.resourceValues(forKeys: [.fileSizeKey, .contentModificationDateKey])
-            files.append((url, values.fileSize ?? 0, values.contentModificationDate ?? .distantPast))
+    private struct CacheFile: Sendable { let url: URL; let bytes: Int; let modified: Date }
+
+    /// 预算内只累计新增文件大小；首次和超预算时离开主线程扫描，避免每句扫描并排序整个缓存。
+    private func trim(keeping keep: URL, adding bytes: Int) async throws {
+        if let knownBytes {
+            let addition = knownBytes.addingReportingOverflow(bytes)
+            self.knownBytes = addition.overflow ? nil : addition.partialValue
+            if !addition.overflow, addition.partialValue <= capacity { return }
         }
-        var size = files.reduce(0) { $0 + $1.1 }
-        for (url, bytes, _) in files.sorted(by: { $0.2 < $1.2 }) where size > capacity && url != keep && !protectedURLs.contains(url) {
-            do { try FileManager.default.removeItem(at: url); size -= bytes } catch { continue }
-        }
+        let directory = root
+        var revision: UInt64
+        var entries: [CacheFile]
+        repeat {
+            revision = cacheMutation
+            let scan = Task.detached(priority: .utility) { try Self.cacheFiles(in: directory) }
+            entries = try await withTaskCancellationHandler { try await scan.value } onCancel: { scan.cancel() }
+            try Task.checkCancellation()
+            // 删除另一本书会改变目录；重新统计，不能把刚删掉的文件算进预算或错误地回收其他书。
+        } while revision != cacheMutation
+        // 新文件仍是 partial，此时扫描不包含它，预算应预留本次将提交的字节。
+        var size = entries.reduce(bytes) { $0 + $1.bytes }
         if size > capacity {
-            try? FileManager.default.removeItem(at: keep)
+            for file in entries.sorted(by: { $0.modified < $1.modified })
+                where size > capacity && file.url != keep && !protectedURLs.contains(file.url) {
+                do { try FileManager.default.removeItem(at: file.url); size -= file.bytes } catch { continue }
+            }
+        }
+        knownBytes = size
+        if size > capacity {
+            knownBytes = nil
             throw SpeechPlaybackError.cacheFull
         }
+    }
+
+    private nonisolated static func cacheFiles(in root: URL) throws -> [CacheFile] {
+        guard let enumerator = FileManager.default.enumerator(at: root, includingPropertiesForKeys: [.fileSizeKey, .contentModificationDateKey], options: [.skipsHiddenFiles]) else { return [] }
+        var entries: [CacheFile] = []
+        for case let url as URL in enumerator where url.pathExtension == "caf" && !url.lastPathComponent.hasSuffix(".partial.caf") {
+            try Task.checkCancellation()
+            // 另一本书被移除时允许跳过刚消失的文件。
+            guard let values = try? url.resourceValues(forKeys: [.fileSizeKey, .contentModificationDateKey]) else { continue }
+            entries.append(CacheFile(url: url, bytes: values.fileSize ?? 0, modified: values.contentModificationDate ?? .distantPast))
+        }
+        return entries
     }
 
     private func preferenceKey(_ language: String) -> String { "FreeReading.voice.\(Self.languageKey(language))" }
 
     static func languageKey(_ language: String) -> String {
-        let base = language.replacingOccurrences(of: "_", with: "-").split(separator: "-").first.map(String.init)?.lowercased() ?? ""
-        return ["zho": "zh", "chi": "zh", "eng": "en", "fra": "fr", "fre": "fr", "deu": "de", "ger": "de", "jpn": "ja"][base] ?? base
+        SpeechLanguagePolicy.languageKey(language)
     }
 }
 

@@ -197,16 +197,204 @@ final class BookRepositoryTests: XCTestCase {
         await expectFailure(try fixture(body: "<img src=\"cover.png\"/>"))
     }
 
+    func testMetadataOpeningDoesNotReadDamagedSpeechIndex() async throws {
+        let library = try repository(); let book = try await library.importEPUB(from: fixture())
+        let bookDirectory = library.bookDirectory(id: book.record.id)
+        try Data("broken".utf8).write(to: bookDirectory.appendingPathComponent("index.json"))
+        try FileManager.default.removeItem(at: bookDirectory.appendingPathComponent("sections.jsonl"))
+        let cold = try repository()
+        let bootstrap = try await cold.prepareReadingBook(id: book.record.id)
+        XCTAssertEqual(bootstrap.book, ReadingBook(book: book))
+        XCTAssertNil(bootstrap.cachedSpeechBook)
+        do { _ = try await cold.loadSpeechBook(id: book.record.id); XCTFail("Damaged speech accepted") } catch {}
+    }
+
+    func testLegacyBookGetsLightCatalogThenMigratesWithoutReimport() async throws {
+        let library = try repository(); let book = try await library.importEPUB(from: fixture())
+        let folder = library.bookDirectory(id: book.record.id)
+        try JSONEncoder().encode(book).write(to: folder.appendingPathComponent("index.json"))
+        for file in ["reading.json", "sections.jsonl", "sentences.jsonl"] { try FileManager.default.removeItem(at: folder.appendingPathComponent(file)) }
+        let cold = try repository()
+        let bootstrap = try await cold.prepareReadingBook(id: book.record.id)
+        XCTAssertEqual(bootstrap.book, ReadingBook(book: book))
+        XCTAssertNil(bootstrap.cachedSpeechBook)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: folder.appendingPathComponent("sentences.jsonl").path))
+        let loaded = try await cold.loadSpeechBook(id: book.record.id)
+        XCTAssertEqual(loaded, book)
+        let header = try BookIndexIO.readJSON(BookIndexIO.Header.self, from: folder.appendingPathComponent("index.json"), limit: 16384)
+        XCTAssertEqual(header.version, 2)
+        let reopened = try await repository().loadBook(id: book.record.id)
+        XCTAssertEqual(reopened, book)
+    }
+
+    func testLegacyCacheWriteFailureStillAllowsReadingAndListeningThenRetries() async throws {
+        let library = try repository(); let book = try await library.importEPUB(from: fixture())
+        let folder = library.bookDirectory(id: book.record.id)
+        try JSONEncoder().encode(book).write(to: folder.appendingPathComponent("index.json"))
+        for file in ["reading.json", "sections.jsonl", "sentences.jsonl"] { try FileManager.default.removeItem(at: folder.appendingPathComponent(file)) }
+        do {
+            // 在普通 macOS 用户下真正拒绝目录中新建/原子替换文件；root CI 不能靠 mode 注入此故障。
+            try FileManager.default.setAttributes([.posixPermissions: 0o555], ofItemAtPath: folder.path)
+            defer { try? FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: folder.path) }
+            try XCTSkipIf(FileManager.default.isWritableFile(atPath: folder.path), "当前用户不受 POSIX 目录只读权限约束")
+            let cold = try repository()
+            let bootstrap = try await cold.prepareReadingBook(id: book.record.id)
+            XCTAssertEqual(bootstrap.book, ReadingBook(book: book))
+            XCTAssertFalse(FileManager.default.fileExists(atPath: folder.appendingPathComponent("reading.json").path))
+            let playable = try await cold.loadSpeechBook(id: book.record.id)
+            XCTAssertEqual(playable, book)
+            XCTAssertFalse(FileManager.default.fileExists(atPath: folder.appendingPathComponent("sentences.jsonl").path))
+        }
+        // 恢复写入能力后的下一次冷加载继续完成迁移，不需要重新导入 EPUB。
+        let retried = try await repository().loadSpeechBook(id: book.record.id)
+        XCTAssertEqual(retried, book)
+        let header = try BookIndexIO.readJSON(BookIndexIO.Header.self, from: folder.appendingPathComponent("index.json"), limit: 16384)
+        XCTAssertEqual(header.version, 2)
+    }
+
+    func testFinalReadingSaveWaitsOnReopenButCanLoadSpeechItself() async throws {
+        let original = try repository(); let book = try await original.importEPUB(from: fixture())
+        let cold = try repository(); let gate = StorageTestGate()
+        let saved = ReadingProgress(bookID: book.record.id, sentenceIndex: 1, audioOffset: 2.4)
+        let save = Task {
+            await gate.wait()
+            _ = try? await cold.loadSpeechBook(id: book.record.id)
+            try? await cold.saveProgress(saved, expectedAddedAt: book.record.addedAt)
+        }
+        cold.registerReadingSave(bookID: book.record.id, expectedAddedAt: book.record.addedAt, task: save)
+        let finished = expectation(description: "Light opener waits for fresh final position")
+        let flag = StorageTestFlag()
+        let opener = Task { () throws -> ReadingBookBootstrap in
+            let result = try await cold.prepareReadingBook(id: book.record.id)
+            flag.mark(); finished.fulfill(); return result
+        }
+        try await Task.sleep(nanoseconds: 30_000_000)
+        XCTAssertFalse(flag.value)
+        await gate.open()
+        await fulfillment(of: [finished], timeout: 3)
+        guard flag.value else { opener.cancel(); return }
+        let bootstrap = try await opener.value
+        XCTAssertEqual(bootstrap.progress, saved)
+    }
+
+    func testProgressWriteFailureKeepsMemoryPositionAndRetries() async throws {
+        let library = try repository(); let book = try await library.importEPUB(from: fixture())
+        let progressURL = library.bookDirectory(id: book.record.id).appendingPathComponent("progress.json")
+        try FileManager.default.createDirectory(at: progressURL, withIntermediateDirectories: true)
+        let saved = ReadingProgress(bookID: book.record.id, sentenceIndex: 1, audioOffset: 4)
+        do { try await library.saveProgress(saved, expectedAddedAt: book.record.addedAt); XCTFail("Injected disk error was hidden") } catch {}
+        let memory = try await library.readingProgress(bookID: book.record.id)
+        XCTAssertEqual(memory, saved)
+        try FileManager.default.removeItem(at: progressURL)
+        let retried = try await library.readingProgress(bookID: book.record.id)
+        XCTAssertEqual(retried, saved)
+        let disk = try await repository().readingProgress(bookID: book.record.id)
+        XCTAssertEqual(disk, saved)
+    }
+
+    func testOldFinalSaveCannotBlockOrOverwriteReimport() async throws {
+        let library = try repository(); let source = try fixture(); let first = try await library.importEPUB(from: source)
+        let gate = StorageTestGate()
+        let oldSave = Task {
+            await gate.wait()
+            try? await library.saveProgress(ReadingProgress(bookID: first.record.id, audioOffset: 5), expectedAddedAt: first.record.addedAt)
+        }
+        library.registerReadingSave(bookID: first.record.id, expectedAddedAt: first.record.addedAt, task: oldSave)
+        try await library.removeBook(id: first.record.id)
+        let second = try await library.importEPUB(from: source)
+        let fresh = try await library.prepareReadingBook(id: second.record.id)
+        XCTAssertNil(fresh.progress)
+        await gate.open(); await oldSave.value
+        let result = try await library.readingProgress(bookID: second.record.id)
+        XCTAssertNil(result)
+    }
+
+    func testImportWorkerDoesNotBlockProgressOrLoseActiveStagingToAnotherInstance() async throws {
+        let library = try repository(); let first = try await library.importEPUB(from: fixture())
+        let source = try fixture(body: "<p>另一本正文。第二句。</p>")
+        let entered = expectation(description: "Heavy worker reached indexing")
+        let block = StorageTestBlockingStage()
+        let importer = Task {
+            try await library.importEPUB(from: source) { progress in
+                if progress.stage == .indexing, block.claim() { entered.fulfill(); block.wait() }
+            }
+        }
+        defer { block.release() }
+        await fulfillment(of: [entered], timeout: 3)
+        _ = try repository() // 初始化另一个实例不能清走正在使用的 .import 目录。
+        let active = try FileManager.default.contentsOfDirectory(atPath: directory.appendingPathComponent("library/books").path)
+        XCTAssertEqual(active.filter { $0.hasPrefix(".import-") }.count, 1)
+        let saved = ReadingProgress(bookID: first.record.id, audioOffset: 1)
+        let stored = expectation(description: "Progress actor remains available")
+        let save = Task { try await library.saveProgress(saved); stored.fulfill() }
+        await fulfillment(of: [stored], timeout: 1)
+        block.release()
+        _ = try await importer.value; try await save.value
+        let result = try await library.readingProgress(bookID: first.record.id)
+        XCTAssertEqual(result, saved)
+    }
+
+    func testQueuedImportCancellationAndActiveImportCancellationCleanStaging() async throws {
+        let library = try repository(); let source = try fixture()
+        let entered = expectation(description: "Active import entered indexing")
+        let block = StorageTestBlockingStage()
+        let first = Task {
+            try await library.importEPUB(from: source) { progress in
+                if progress.stage == .indexing, block.claim() { entered.fulfill(); block.wait() }
+            }
+        }
+        defer { block.release() }
+        await fulfillment(of: [entered], timeout: 3)
+        let second = Task { try await library.importEPUB(from: source) }
+        second.cancel()
+        switch await second.result {
+        case .success: XCTFail("Queued cancellation ignored")
+        case .failure(let error): XCTAssertTrue(error is CancellationError)
+        }
+        first.cancel(); block.release()
+        switch await first.result {
+        case .success: XCTFail("Active cancellation ignored")
+        case .failure(let error): XCTAssertTrue(error is CancellationError)
+        }
+        let remaining = try FileManager.default.contentsOfDirectory(atPath: directory.appendingPathComponent("library/books").path)
+        XCTAssertTrue(remaining.isEmpty)
+    }
+
+    func testStartupRecoversAbandonedTemporaryDirectoriesOnly() throws {
+        let root = directory.appendingPathComponent("library")
+        for path in ["books/.import-crashed", ".trash-crashed", "books/keep-me", "keep-me"] {
+            try FileManager.default.createDirectory(at: root.appendingPathComponent(path), withIntermediateDirectories: true)
+        }
+        _ = try repository()
+        XCTAssertFalse(FileManager.default.fileExists(atPath: root.appendingPathComponent("books/.import-crashed").path))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: root.appendingPathComponent(".trash-crashed").path))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: root.appendingPathComponent("books/keep-me").path))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: root.appendingPathComponent("keep-me").path))
+    }
+
+    func testRTLSpineIsPreservedAndLegacyMetadataDefaultsToLTR() async throws {
+        let library = try repository()
+        let book = try await library.importEPUB(from: fixture(spineAttributes: "page-progression-direction=\"rtl\""))
+        XCTAssertEqual(book.record.readingDirection, .rightToLeft)
+        let reopened = try await repository().prepareReadingBook(id: book.record.id)
+        XCTAssertEqual(reopened.book.readingDirection, .rightToLeft)
+        var legacy = book; legacy.record.readingDirection = nil
+        let data = try JSONEncoder().encode(legacy.record)
+        let decoded = try JSONDecoder().decode(BookRecord.self, from: data)
+        legacy.record = decoded
+        XCTAssertEqual(ReadingBook(book: legacy).readingDirection, .leftToRight)
+    }
+
     private func expectFailure(_ source: URL, file: StaticString = #filePath, line: UInt = #line) async {
         do { _ = try await repository().importEPUB(from: source); XCTFail("Invalid EPUB accepted", file: file, line: line) } catch {}
     }
 
     /// 原创最小 EPUB，允许单项故障注入；ZIP 使用公开 provider API，不依赖命令行 zip。
-    private func fixture(body: String = "<h1 id=\"anchor\">标题</h1><p>第一句。第二句！</p>", nav: String? = nil, ncx: String? = nil, bom: Bool = false, metadataExtra: String = "", manifestExtra: String = "", chapterHref: String = "chapter.xhtml", extras: [(String, Data, Entry.EntryType)] = []) throws -> URL {
+    private func fixture(body: String = "<h1 id=\"anchor\">标题</h1><p>第一句。第二句！</p>", nav: String? = nil, ncx: String? = nil, bom: Bool = false, metadataExtra: String = "", manifestExtra: String = "", chapterHref: String = "chapter.xhtml", spineAttributes: String = "", extras: [(String, Data, Entry.EntryType)] = []) throws -> URL {
         let source = directory.appendingPathComponent(UUID().uuidString + ".epub")
         let archive = try Archive(url: source, accessMode: .create)
         let navItem = ncx == nil ? "<item id=\"nav\" href=\"nav.xhtml\" media-type=\"application/xhtml+xml\" properties=\"nav\"/>" : "<item id=\"ncx\" href=\"toc.ncx\" media-type=\"application/x-dtbncx+xml\"/>"
-        let opf = "<package version=\"3.0\" unique-identifier=\"uid\"><metadata xmlns:dc=\"http://purl.org/dc/elements/1.1/\"><dc:identifier id=\"uid\">urn:uuid:12345678-1234-1234-1234-123456789abc</dc:identifier><dc:title>原创测试书</dc:title><dc:creator>FreeReading</dc:creator><dc:language>zh-CN</dc:language>\(metadataExtra)</metadata><manifest><item id=\"chapter\" href=\"\(chapterHref)\" media-type=\"application/xhtml+xml\"/>\(navItem)\(manifestExtra)</manifest><spine toc=\"ncx\"><itemref idref=\"chapter\"/></spine></package>"
+        let opf = "<package version=\"3.0\" unique-identifier=\"uid\"><metadata xmlns:dc=\"http://purl.org/dc/elements/1.1/\"><dc:identifier id=\"uid\">urn:uuid:12345678-1234-1234-1234-123456789abc</dc:identifier><dc:title>原创测试书</dc:title><dc:creator>FreeReading</dc:creator><dc:language>zh-CN</dc:language>\(metadataExtra)</metadata><manifest><item id=\"chapter\" href=\"\(chapterHref)\" media-type=\"application/xhtml+xml\"/>\(navItem)\(manifestExtra)</manifest><spine toc=\"ncx\" \(spineAttributes)><itemref idref=\"chapter\"/></spine></package>"
         let html = "<!DOCTYPE html><html><head><title>测试</title></head><body>\(body)</body></html>"
         var chapter = Data(html.utf8); if bom { chapter = Data([0xEF, 0xBB, 0xBF]) + chapter }
         var entries: [(String, Data, Entry.EntryType)] = [
@@ -225,6 +413,26 @@ final class BookRepositoryTests: XCTestCase {
         }
         return source
     }
+}
+
+/// 测试显式控制并发次序，避免用整本长书的耗时偶然性判断 actor 是否被阻塞。
+private actor StorageTestGate {
+    private var isOpen = false
+    private var pending: [CheckedContinuation<Void, Never>] = []
+    func wait() async { if !isOpen { await withCheckedContinuation { pending.append($0) } } }
+    func open() { isOpen = true; let values = pending; pending.removeAll(); values.forEach { $0.resume() } }
+}
+private final class StorageTestFlag: @unchecked Sendable {
+    private let lock = NSLock(); private var completed = false
+    var value: Bool { lock.lock(); defer { lock.unlock() }; return completed }
+    func mark() { lock.lock(); completed = true; lock.unlock() }
+}
+private final class StorageTestBlockingStage: @unchecked Sendable {
+    private let lock = NSLock(); private var claimed = false
+    private let semaphore = DispatchSemaphore(value: 0)
+    func claim() -> Bool { lock.lock(); defer { lock.unlock() }; if claimed { return false }; claimed = true; return true }
+    func wait() { semaphore.wait() }
+    func release() { semaphore.signal() }
 }
 
 private final class ProgressValues: @unchecked Sendable {

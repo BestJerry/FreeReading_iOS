@@ -1,5 +1,8 @@
 import Foundation
 
+/// EPUB 的页面前进方向；旧书未保存此字段时沿用从左向右的阅读方式。
+public enum ReadingDirection: String, Codable, Sendable { case leftToRight, rightToLeft }
+
 /// 书架元数据；书籍 ID 使用原 EPUB 的 SHA-256，原文件移走后仍可独立阅读。
 public struct BookRecord: Codable, Identifiable, Equatable, Sendable {
     public var id: String
@@ -10,11 +13,42 @@ public struct BookRecord: Codable, Identifiable, Equatable, Sendable {
     public var coverPath: String?
     public var chapterCount: Int
     public var sentenceCount: Int
+    public var readingDirection: ReadingDirection?
 
-    public init(id: String, title: String, author: String = "", language: String = "zh-CN", addedAt: Date = Date(), coverPath: String? = nil, chapterCount: Int = 0, sentenceCount: Int = 0) {
+    public init(id: String, title: String, author: String = "", language: String = "zh-CN", addedAt: Date = Date(), coverPath: String? = nil, chapterCount: Int = 0, sentenceCount: Int = 0, readingDirection: ReadingDirection? = nil) {
         self.id = id; self.title = title; self.author = author; self.language = language
         self.addedAt = addedAt; self.coverPath = coverPath
         self.chapterCount = chapterCount; self.sentenceCount = sentenceCount
+        self.readingDirection = readingDirection
+    }
+}
+
+/// 首屏所需的小型目录，与完整听书索引独立保存，长书也能先展示原文。
+public struct ReadingBook: Codable, Equatable, Sendable {
+    public var record: BookRecord
+    public var chapters: [BookChapter]
+    public var contents: [ContentsEntry]
+    public var chapterWeights: [Double]
+    public var readingDirection: ReadingDirection { record.readingDirection ?? .leftToRight }
+    public init(record: BookRecord, chapters: [BookChapter], contents: [ContentsEntry], chapterWeights: [Double]) {
+        self.record = record; self.chapters = chapters; self.contents = contents; self.chapterWeights = chapterWeights
+    }
+    public init(book: SpeechBook) {
+        var weights = Array(repeating: 0.0, count: book.chapters.count)
+        for section in book.sections where weights.indices.contains(section.chapterIndex) {
+            weights[section.chapterIndex] += Double(section.text.utf16.count)
+        }
+        self.init(record: book.record, chapters: book.chapters, contents: book.contents, chapterWeights: weights)
+    }
+}
+
+/// 同一次开书得到的目录和阅读位置；内存中已有听书索引时复用它。
+public struct ReadingBookBootstrap: Equatable, Sendable {
+    public var book: ReadingBook
+    public var progress: ReadingProgress?
+    public var cachedSpeechBook: SpeechBook?
+    public init(book: ReadingBook, progress: ReadingProgress? = nil, cachedSpeechBook: SpeechBook? = nil) {
+        self.book = book; self.progress = progress; self.cachedSpeechBook = cachedSpeechBook
     }
 }
 
@@ -111,5 +145,11 @@ public struct ImportProgress: Equatable, Sendable {
     public var completed: Int64
     public var total: Int64?
     public var fraction: Double? { total.flatMap { $0 > 0 ? min(1, max(0, Double(completed) / Double($0))) : nil } }
+    /// 使用宽整数乘除，既不受浮点舍入影响，也不会因超大文件的字节数乘 100 溢出。
+    public var percent: Int? {
+        guard let total, total > 0 else { return nil }
+        let current = UInt64(min(total, max(0, completed)))
+        return Int(UInt64(total).dividingFullWidth(current.multipliedFullWidth(by: 100)).quotient)
+    }
     public init(stage: Stage, completed: Int64 = 0, total: Int64? = nil) { self.stage = stage; self.completed = completed; self.total = total }
 }

@@ -2,6 +2,7 @@
 set -euo pipefail
 project_root="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$project_root"
+python3 Tests/Scripts/test_generate_project.py
 swift test --jobs 2
 xcodebuild -project FreeReading.xcodeproj -scheme FreeReading \
   -configuration Debug -jobs 2 -sdk iphonesimulator \

@@ -2,6 +2,7 @@
 .build/
 DerivedData/
 .build-ios/
+.build-device/
 *.xcuserstate
 xcuserdata/
 *.ipa

@@ -14,19 +14,29 @@ final class PlaybackController: NSObject, ObservableObject {
     private let cache = SpeechAudioCache()
     private var player: AVAudioPlayer?
     private var timeline: PlaybackTimeline?
-    private var generation: UInt64 = 0
+    private var coordinator = PlaybackCoordinator()
+    private var playerTicket: PlaybackCoordinator.Ticket?
     private var operation: Task<Void, Never>?
     private var prefetch: Task<Void, Never>?
-    private var shouldPlay = false
+    private var shouldPlay: Bool { coordinator.wantsPlayback }
     private var currentClipURL: URL?
-    private var prefetchedURLs: [URL] = []
+    private var prefetchWindow = SpeechPrefetchWindow()
+    private var prefetchedClips: [Int: CachedSpeechClip] = [:]
+    private struct PreparedNextPlayer {
+        let index: Int
+        let voiceID: String
+        let session: PlaybackCoordinator.Session
+        let player: AVAudioPlayer
+    }
+    private var preparedNextPlayer: PreparedNextPlayer?
+    private var resolvedVoice: AVSpeechSynthesisVoice?
+    private var resolvedVoiceName = "自动选择"
+    private var audioSessionReady = false
     private var timer: Timer?
     private var lastSaved = ProcessInfo.processInfo.systemUptime
     private var observers: [NSObjectProtocol] = []
     private var remoteTargets: [(MPRemoteCommand, Any)] = []
-    private var interruptedPlayback = false
     private var artwork: MPMediaItemArtwork?
-    private var pendingSeek: (anchor: SentencePosition, delta: Double)?
 
     init(repository: BookRepository) {
         self.repository = repository
@@ -51,53 +61,56 @@ final class PlaybackController: NSObject, ObservableObject {
     /// 明确的书籍／句子选择建立新代次；先捕获旧书位置，再替换书籍，避免跨书保存。
     func start(book newBook: SpeechBook, sentenceIndex: Int, offset: Double = 0) {
         guard !newBook.sentences.isEmpty else { return }
-        saveCurrent()
-        let changedBook = book?.record.id != newBook.record.id
+        saveCurrent(final: true)
+        let changedBook = book?.record.id != newBook.record.id || book?.record.addedAt != newBook.record.addedAt
         book = newBook
-        if changedBook { timeline = nil; artwork = nil; loadArtwork(for: newBook) }
-        pendingSeek = nil
-        interruptedPlayback = false
+        if changedBook { timeline = nil; resolvedVoice = nil; artwork = nil; loadArtwork(for: newBook) }
+        coordinator.open(bookID: newBook.record.id, addedAt: newBook.record.addedAt, sentenceCount: newBook.sentences.count)
         prepare(index: min(max(0, sentenceIndex), newBook.sentences.count - 1), offset: offset, autoplay: true)
     }
 
-    /// 准备期间也记录最新播放意图；稍后音频到达时不能覆盖用户刚按下的暂停。
+    /// 准备期间也记录最新播放意图；音频到达时以协调器中的最新暂停意图为准。
     func toggle() {
         guard book != nil else { return }
         if snapshot.isPreparing {
-            shouldPlay.toggle()
-            interruptedPlayback = false
+            coordinator.setPlaybackIntent(!shouldPlay)
             refreshSnapshot()
         } else if shouldPlay && player?.isPlaying == true {
             pause()
-        } else if let player, player.currentTime < max(0, player.duration - 0.02) {
+        } else {
+            resumeCurrent()
+        }
+    }
+
+    private func resumeCurrent() {
+        coordinator.setPlaybackIntent(true)
+        if snapshot.isPreparing { refreshSnapshot(); return }
+        if coordinator.canResumeInstalledPlayer, let player, player.currentTime < max(0, player.duration - 0.02) {
             do {
                 try activateSession()
-                shouldPlay = true
-                interruptedPlayback = false
                 snapshot.error = nil
                 guard player.play() else { throw SpeechPlaybackError.invalidAudio }
                 refreshSnapshot()
             } catch { fail(error) }
         } else {
-            prepare(index: snapshot.sentenceIndex, offset: snapshot.error == nil ? 0 : snapshot.position, autoplay: true)
+            let recovery = coordinator.recoveryPosition(at: .init(index: snapshot.sentenceIndex, offset: currentPosition()),
+                                                        duration: player?.duration ?? snapshot.duration)
+            prepare(index: snapshot.sentenceIndex, offset: recovery?.offset ?? (snapshot.error == nil ? 0 : snapshot.position), autoplay: true)
         }
     }
 
     func pause() {
-        shouldPlay = false
-        interruptedPlayback = false
+        coordinator.pause()
         player?.pause()
         refreshSnapshot()
-        saveCurrent()
+        saveCurrent(final: true)
     }
 
-    /// 停止立即清除会话并使所有旧结果失效；捕获的进度交由书库按更新时间保存。
+    /// 停止前捕获所属导入批次的进度，随后取消所有副作用并使迟到结果失效。
     func stop() {
-        saveCurrent()
+        saveCurrent(final: true)
+        coordinator.stop()
         replaceWork()
-        shouldPlay = false
-        interruptedPlayback = false
-        pendingSeek = nil
         book = nil
         timeline = nil
         artwork = nil
@@ -105,6 +118,7 @@ final class PlaybackController: NSObject, ObservableObject {
         MPNowPlayingInfoCenter.default().nowPlayingInfo = nil
         updateRemoteAvailability()
         try? AVAudioSession.sharedInstance().setActive(false, options: .notifyOthersOnDeactivation)
+        audioSessionReady = false
     }
 
     /// 书架移除书籍时调用，保证音频不再引用待删除的缓存。
@@ -117,11 +131,9 @@ final class PlaybackController: NSObject, ObservableObject {
     func seek(by delta: Double) {
         guard let currentBook = book, delta.isFinite else { return }
         saveCurrent()
-        let previous = pendingSeek
-        let anchor = previous?.anchor ?? SentencePosition(index: snapshot.sentenceIndex, offset: currentPosition())
-        let accumulated = min(3_600, max(-3_600, (previous?.delta ?? 0) + min(3_600, max(-3_600, delta))))
-        pendingSeek = (anchor, accumulated)
-        let token = replaceWork()
+        guard let seek = coordinator.seek(by: delta, from: .init(index: snapshot.sentenceIndex, offset: currentPosition())) else { return }
+        let token = seek.ticket
+        replaceWork()
         snapshot.isPreparing = true
         snapshot.isPlaying = false
         snapshot.wantsPlayback = shouldPlay
@@ -132,17 +144,16 @@ final class PlaybackController: NSObject, ObservableObject {
             do {
                 try self.activateSession()
                 try await self.ensureTimeline(currentBook, token: token)
-                let voice = try self.cache.effectiveVoice(language: currentBook.record.language)
-                let target = try await PlaybackTimeline.seek(sentenceCount: currentBook.sentences.count, from: anchor, by: accumulated) { index in
+                let voice = try self.voice(for: currentBook)
+                let target = try await PlaybackTimeline.seek(sentenceCount: currentBook.sentences.count, from: seek.anchor, by: seek.delta) { index in
                     try await self.cache.ensure(bookID: currentBook.record.id, text: currentBook.text(at: index), voice: voice).duration
                 }
                 try self.check(token)
-                self.pendingSeek = nil
                 self.publishTarget(target.index, offset: target.offset)
                 try await self.install(index: target.index, offset: target.offset, fraction: nil, voice: voice, token: token)
             } catch is CancellationError { }
-            catch { if token == self.generation { self.fail(error) } }
-            if token == self.generation { self.operation = nil }
+            catch { if self.coordinator.accepts(token) { self.fail(error) } }
+            if self.coordinator.accepts(token) { self.operation = nil }
         }
     }
 
@@ -154,11 +165,33 @@ final class PlaybackController: NSObject, ObservableObject {
         snapshot.speed = min(2, max(0.5, speed))
         UserDefaults.standard.set(snapshot.speed, forKey: "FreeReading.playback.speed")
         player?.rate = snapshot.speed
+        preparedNextPlayer?.player.rate = snapshot.speed
+        // 定位准备中快照仍可能指向旧句，不能因此为旧游标另建预取窗口。
+        if coordinator.phase == .ready, !snapshot.isPreparing,
+           let currentBook = book, let voice = resolvedVoice {
+            launchPrefetch(currentBook, from: snapshot.sentenceIndex, voice: voice)
+        }
         refreshSnapshot()
     }
 
     func availableVoices(language: String) -> [VoiceOption] {
-        cache.voices(language: language).map { VoiceOption(id: $0.identifier, name: $0.name, language: $0.language) }
+        cache.voices(language: language).map {
+            VoiceOption(id: $0.identifier, name: $0.name, language: $0.language,
+                        availabilityText: cache.isValidated(voiceID: $0.identifier) ? "已验证可合成（本次运行）" : "尚未验证可合成")
+        }
+    }
+
+    /// 从系统设置返回或用户点击刷新时重新枚举，失效的偏好由目录验证自动清除。
+    @discardableResult
+    func refreshVoices(language: String) -> [VoiceOption] {
+        _ = cache.refreshVoices(language: language)
+        // 刷新可能清除失效偏好；下一次定位重新解析，连续播放平时不重复枚举系统目录。
+        resolvedVoice = nil
+        return availableVoices(language: language)
+    }
+
+    func validateVoice(id: String, language: String) async throws {
+        try await cache.validateVoice(id: id, language: language)
     }
 
     func selectedVoiceID(language: String) -> String? { cache.selectedID(language: language) }
@@ -166,12 +199,13 @@ final class PlaybackController: NSObject, ObservableObject {
     /// 音色偏好按语言保存；当前书籍换声时按句内比例恢复，并保留最新播放／暂停状态。
     func selectVoice(id: String?, language: String) {
         let appliesToCurrent = book.map { SpeechAudioCache.languageKey($0.record.language) == SpeechAudioCache.languageKey(language) } ?? false
-        let ratio: Double? = snapshot.duration > 0 ? min(1, max(0, currentPosition() / snapshot.duration)) : nil
+        let current = SentencePosition(index: snapshot.sentenceIndex, offset: currentPosition())
+        let duration = snapshot.duration
         cache.select(id: id, language: language)
         if appliesToCurrent {
+            resolvedVoice = nil
             saveCurrent()
-            pendingSeek = nil
-            prepare(index: snapshot.sentenceIndex, offset: snapshot.position, autoplay: nil, fraction: ratio)
+            if let preparation = coordinator.changeVoice(from: current, duration: duration) { execute(preparation) }
         }
     }
 
@@ -180,49 +214,87 @@ final class PlaybackController: NSObject, ObservableObject {
         let target = forward ? timeline.nextChapter(at: snapshot.sentenceIndex) : timeline.previousChapter(at: snapshot.sentenceIndex)
         guard let target else { return }
         saveCurrent()
-        pendingSeek = nil
-        interruptedPlayback = false
         prepare(index: target, offset: 0, autoplay: true)
     }
 
-    /// 清空旧播放器后设置初始播放意图；合成挂起期间的 pause() 具有最终决定权。
-    private func prepare(index: Int, offset: Double, autoplay: Bool?, fraction: Double? = nil) {
-        guard let currentBook = book, currentBook.sentences.indices.contains(index) else { return }
-        let token = replaceWork()
-        if let autoplay { shouldPlay = autoplay }
-        publishTarget(index, offset: offset)
-        operation = Task { [weak self] in
-            guard let self else { return }
-            do {
-                try self.activateSession()
-                try await self.ensureTimeline(currentBook, token: token)
-                self.publishTarget(index, offset: offset)
-                let voice = try self.cache.effectiveVoice(language: currentBook.record.language)
-                try await self.install(index: index, offset: offset, fraction: fraction, voice: voice, token: token)
-            } catch is CancellationError { }
-            catch { if token == self.generation { self.fail(error) } }
-            if token == self.generation { self.operation = nil }
+    /// 锁屏和耳机的上一项／下一项按句切换，App 内独立的章按钮仍然从章首开播。
+    private func moveSentence(by delta: Int) {
+        guard book != nil else { return }
+        saveCurrent()
+        if let preparation = coordinator.moveSentence(by: delta, from: snapshot.sentenceIndex) { execute(preparation) }
+    }
+
+    private func prepare(index: Int, offset: Double, autoplay: Bool?) {
+        guard let preparation = coordinator.prepare(at: .init(index: index, offset: offset), autoplay: autoplay) else { return }
+        execute(preparation)
+    }
+
+    /// 显式定位取消旧工作；自然换句保留同一音色窗口，并同步接续已经准备好的播放器。
+    private func execute(_ preparation: PlaybackCoordinator.Preparation) {
+        guard let currentBook = book else { return }
+        let token = preparation.ticket, index = preparation.position.index, offset = preparation.position.offset
+        let continuous = preparation.transition == .continuous
+        if continuous {
+            operation?.cancel(); operation = nil
+            // AVAudioPlayer.stop 会同步释放硬件；自然结束的播放器不再主动 stop。
+            releaseCurrentPlayer(stopping: false)
+        } else { replaceWork() }
+        do {
+            let voice = try voice(for: currentBook)
+            if continuous, let window = prefetchWindow.ticket,
+               window.session != coordinator.session || window.voiceID != voice.identifier {
+                replaceWork()
+            }
+            if timeline != nil,
+               let clip = prefetchedClips[index] ?? cache.cachedClip(bookID: currentBook.record.id, text: currentBook.text(at: index), voice: voice) {
+                try installPreparedClip(clip, index: index, offset: offset, fraction: preparation.fraction, voice: voice, token: token)
+                return
+            }
+            publishTarget(index, offset: offset)
+            operation = Task { [weak self] in
+                guard let self else { return }
+                do {
+                    try self.activateSession()
+                    try await self.ensureTimeline(currentBook, token: token)
+                    try await self.install(index: index, offset: offset, fraction: preparation.fraction, voice: voice, token: token)
+                } catch is CancellationError { }
+                catch { if self.coordinator.accepts(token) { self.fail(error) } }
+                if self.coordinator.accepts(token) { self.operation = nil }
+            }
+        } catch {
+            publishTarget(index, offset: offset)
+            fail(error)
         }
     }
 
-    @discardableResult
-    private func replaceWork() -> UInt64 {
-        generation &+= 1
-        operation?.cancel()
-        prefetch?.cancel()
-        operation = nil
-        prefetch = nil
+    /// 手动跳转、换声、切书和停止才撤销整个窗口；自然推进不调用此方法。
+    private func replaceWork() {
+        operation?.cancel(); operation = nil
+        prefetch?.cancel(); prefetch = nil
+        prefetchWindow.reset()
         cache.cancel()
-        player?.delegate = nil
-        player?.stop()
-        player = nil
-        currentClipURL = nil
-        prefetchedURLs = []
+        releaseCurrentPlayer(stopping: true)
+        preparedNextPlayer = nil
+        prefetchedClips = [:]
         cache.protect([])
-        return generation
     }
 
-    private func ensureTimeline(_ currentBook: SpeechBook, token: UInt64) async throws {
+    private func releaseCurrentPlayer(stopping: Bool) {
+        player?.delegate = nil
+        if stopping { player?.stop() }
+        player = nil; playerTicket = nil; currentClipURL = nil
+    }
+
+    private func voice(for currentBook: SpeechBook) throws -> AVSpeechSynthesisVoice {
+        if let resolvedVoice { return resolvedVoice }
+        let selected = cache.selectedID(language: currentBook.record.language)
+        let voice = try cache.effectiveVoice(language: currentBook.record.language)
+        resolvedVoice = voice
+        resolvedVoiceName = selected == nil ? "自动 · \(voice.name)" : voice.name
+        return voice
+    }
+
+    private func ensureTimeline(_ currentBook: SpeechBook, token: PlaybackCoordinator.Ticket) async throws {
         if timeline == nil {
             let prepared = await Task.detached(priority: .userInitiated) { PlaybackTimeline(book: currentBook) }.value
             try check(token)
@@ -230,56 +302,105 @@ final class PlaybackController: NSObject, ObservableObject {
         }
     }
 
-    /// 只有当前代次可以安装播放器；句子序号与真实音频时间同步发布给原文页。
-    private func install(index: Int, offset: Double, fraction: Double?, voice: AVSpeechSynthesisVoice, token: UInt64) async throws {
+    /// 前台请求会接管同键的在途预取，而不是把它取消后重新合成。
+    private func install(index: Int, offset: Double, fraction: Double?, voice: AVSpeechSynthesisVoice, token: PlaybackCoordinator.Ticket) async throws {
         guard let currentBook = book else { throw CancellationError() }
-        let clip = try await cache.ensure(bookID: currentBook.record.id, text: currentBook.text(at: index), voice: voice)
+        let clip = try await cache.ensure(bookID: currentBook.record.id, text: currentBook.text(at: index), voice: voice, priority: .playback)
         try check(token)
-        let next = try AVAudioPlayer(contentsOf: clip.url)
+        try installPreparedClip(clip, index: index, offset: offset, fraction: fraction, voice: voice, token: token)
+    }
+
+    /// 热缓存接续全程不发布 preparing，且优先使用播放期间已经 prepareToPlay 的下一句。
+    private func installPreparedClip(_ clip: CachedSpeechClip, index: Int, offset: Double, fraction: Double?, voice: AVSpeechSynthesisVoice, token: PlaybackCoordinator.Ticket) throws {
+        guard let currentBook = book else { throw CancellationError() }
+        try check(token)
+        let next: AVAudioPlayer
+        if let prepared = preparedNextPlayer, prepared.index == index,
+           prepared.voiceID == voice.identifier, prepared.session == coordinator.session {
+            next = prepared.player
+        } else { next = try makePlayer(for: clip) }
+        preparedNextPlayer = nil
+        guard let accepted = coordinator.install(token, at: .init(index: index, offset: offset), duration: clip.duration, fraction: fraction) else { throw CancellationError() }
+        next.currentTime = accepted.offset
         next.delegate = self
-        next.enableRate = true
         next.rate = snapshot.speed
-        guard next.prepareToPlay() else { throw SpeechPlaybackError.invalidAudio }
-        let requested = fraction.map { $0 * clip.duration } ?? offset
-        next.currentTime = min(max(0, requested.isFinite ? requested : 0), max(0, clip.duration - 0.005))
-        player = next
-        currentClipURL = clip.url
-        cache.protect([clip.url])
+        player = next; playerTicket = token; currentClipURL = clip.url
+        let sentence = currentBook.sentences[index]
+        snapshot.bookID = currentBook.record.id
         snapshot.sentenceIndex = index
+        snapshot.chapterIndex = sentence.chapterIndex
+        snapshot.text = currentBook.text(at: index)
+        snapshot.position = accepted.offset
         snapshot.duration = clip.duration
         snapshot.isPreparing = false
         snapshot.error = nil
-        snapshot.voiceName = cache.selectedID(language: currentBook.record.language) == nil ? "自动 · \(voice.name)" : voice.name
+        snapshot.voiceName = resolvedVoiceName
         if shouldPlay {
             try activateSession()
             guard next.play() else { throw SpeechPlaybackError.invalidAudio }
         }
+        launchPrefetch(currentBook, from: index, voice: voice)
         refreshSnapshot()
         saveCurrent()
-        launchPrefetch(currentBook, from: index, voice: voice, token: token)
     }
 
-    /// 仅缓存接下来的两句，优先保证当前句开播，失败留待实际播放时展示和重试。
-    private func launchPrefetch(_ currentBook: SpeechBook, from index: Int, voice: AVSpeechSynthesisVoice, token: UInt64) {
-        guard index + 1 < currentBook.sentences.count else { return }
+    private func makePlayer(for clip: CachedSpeechClip) throws -> AVAudioPlayer {
+        let next = try AVAudioPlayer(contentsOf: clip.url)
+        next.enableRate = true; next.rate = snapshot.speed
+        guard next.prepareToPlay() else { throw SpeechPlaybackError.invalidAudio }
+        return next
+    }
+
+    /// 小窗口按真实时长补足约 12 秒播放储备，最多 12 句；同一在途任务跨自然换句继续工作。
+    private func launchPrefetch(_ currentBook: SpeechBook, from index: Int, voice: AVSpeechSynthesisVoice) {
+        guard let session = coordinator.session else { return }
+        let previousTicket = prefetchWindow.ticket
+        let token = prefetchWindow.advance(session: session, voiceID: voice.identifier, index: index,
+                                           sentenceCount: currentBook.sentences.count, speed: Double(snapshot.speed))
+        if previousTicket != token {
+            // 只撤销旧预取消费者；若前台已接管同句，单飞队列仍保留前台消费者的合成。
+            prefetch?.cancel(); prefetch = nil
+        }
+        let retained = prefetchWindow.retainedIndices
+        prefetchedClips = prefetchedClips.filter { retained.contains($0.key) }
+        refreshCacheProtection()
+        prepareNextPlayerIfAvailable(voice: voice, session: session)
+        guard let work = prefetchWindow.beginWork() else { return }
         prefetch = Task { [weak self] in
             guard let self else { return }
             do {
-                for target in (index + 1)..<min(index + 3, currentBook.sentences.count) {
-                    try self.check(token)
-                    let clip = try await self.cache.ensure(bookID: currentBook.record.id, text: currentBook.text(at: target), voice: voice)
-                    try self.check(token)
-                    self.prefetchedURLs.append(clip.url)
-                    self.cache.protect([self.currentClipURL].compactMap { $0 } + self.prefetchedURLs)
+                while self.prefetchWindow.accepts(work), let target = self.prefetchWindow.nextTarget {
+                    try Task.checkCancellation()
+                    let clip = try await self.cache.ensure(bookID: currentBook.record.id, text: currentBook.text(at: target), voice: voice, priority: .prefetch)
+                    try Task.checkCancellation()
+                    guard self.prefetchWindow.accepts(work) else { break }
+                    if self.prefetchWindow.record(index: target, duration: clip.duration, ticket: token) {
+                        self.prefetchedClips[target] = clip
+                        self.refreshCacheProtection()
+                        self.prepareNextPlayerIfAvailable(voice: voice, session: session)
+                    }
                 }
-            } catch { /* 预取不能抢占或中断当前播放。 */ }
-            if token == self.generation { self.prefetch = nil }
+            } catch { /* 前台会在真正需要时重试，预取失败不停止当前音频。 */ }
+            if self.prefetchWindow.endWork(work) { self.prefetch = nil }
         }
     }
 
-    private func check(_ token: UInt64) throws {
+    private func prepareNextPlayerIfAvailable(voice: AVSpeechSynthesisVoice, session: PlaybackCoordinator.Session) {
+        let index = snapshot.sentenceIndex + 1
+        if let prepared = preparedNextPlayer, prepared.index == index,
+           prepared.voiceID == voice.identifier, prepared.session == session { return }
+        preparedNextPlayer = nil
+        guard let clip = prefetchedClips[index], let next = try? makePlayer(for: clip) else { return }
+        preparedNextPlayer = PreparedNextPlayer(index: index, voiceID: voice.identifier, session: session, player: next)
+    }
+
+    private func refreshCacheProtection() {
+        cache.protect([currentClipURL].compactMap { $0 } + prefetchedClips.values.map(\.url))
+    }
+
+    private func check(_ token: PlaybackCoordinator.Ticket) throws {
         try Task.checkCancellation()
-        guard token == generation, book != nil else { throw CancellationError() }
+        guard coordinator.accepts(token), book != nil else { throw CancellationError() }
     }
 
     private func publishTarget(_ index: Int, offset: Double) {
@@ -324,25 +445,34 @@ final class PlaybackController: NSObject, ObservableObject {
     }
 
     /// 播放游标以句子定位保存；书库拒绝过期时间和已移除书籍的迟到写入。
-    private func saveCurrent(positionOverride: Double? = nil) {
-        guard let book, book.sentences.indices.contains(snapshot.sentenceIndex) else { return }
-        let sentence = book.sentences[snapshot.sentenceIndex]
+    private func saveCurrent(positionOverride: Double? = nil, final: Bool = false) {
+        guard let book,
+              let checkpoint = coordinator.checkpoint(at: .init(index: snapshot.sentenceIndex, offset: positionOverride ?? currentPosition())),
+              checkpoint.session.bookID == book.record.id, checkpoint.session.addedAt == book.record.addedAt,
+              book.sentences.indices.contains(checkpoint.position.index) else { return }
+        let sentence = book.sentences[checkpoint.position.index]
         let section = book.sections[sentence.sectionID]
         let progress = ReadingProgress(bookID: book.record.id, chapterIndex: sentence.chapterIndex,
-            elementID: section.elementID, textOffset: sentence.range.start, sentenceIndex: snapshot.sentenceIndex,
-            audioOffset: max(0, positionOverride ?? currentPosition()), updatedAt: Date())
+            elementID: section.elementID, textOffset: sentence.range.start, sentenceIndex: checkpoint.position.index,
+            audioOffset: checkpoint.position.offset, updatedAt: Date())
         lastSaved = ProcessInfo.processInfo.systemUptime
-        Task { [weak self, repository] in
-            do { try await repository.saveProgress(progress, expectedAddedAt: book.record.addedAt) }
+        let save = Task { [weak self, repository] in
+            do { try await repository.saveProgress(progress, expectedAddedAt: checkpoint.session.addedAt) }
             catch {
-                guard let self, self.book?.record.id == progress.bookID else { return }
+                guard let self, self.book?.record.id == progress.bookID, self.book?.record.addedAt == checkpoint.session.addedAt else { return }
                 if self.snapshot.error == nil { self.snapshot.error = "进度暂时无法保存，请检查设备存储；当前音频可继续播放。" }
             }
         }
+        if final { repository.registerReadingSave(bookID: progress.bookID, expectedAddedAt: checkpoint.session.addedAt, task: save) }
     }
 
     private func fail(_ error: Error) {
-        shouldPlay = false
+        coordinator.fail()
+        prefetch?.cancel(); prefetch = nil
+        prefetchWindow.reset()
+        preparedNextPlayer = nil; prefetchedClips = [:]
+        cache.cancel()
+        refreshCacheProtection()
         player?.pause()
         snapshot.isPreparing = false
         snapshot.isPlaying = false
@@ -352,9 +482,11 @@ final class PlaybackController: NSObject, ObservableObject {
     }
 
     private func activateSession() throws {
+        guard !audioSessionReady else { return }
         let session = AVAudioSession.sharedInstance()
         try session.setCategory(.playback, mode: .spokenAudio, options: [])
         try session.setActive(true)
+        audioSessionReady = true
     }
 
     /// 锁屏的时间轴使用当前已生成句子的真实媒体时间，应用内仍显示整章正文百分比。
@@ -391,8 +523,8 @@ final class PlaybackController: NSObject, ObservableObject {
         center.skipBackwardCommand.preferredIntervals = [15]
         add(center.skipForwardCommand) { $0.seek(by: 15) }
         add(center.skipBackwardCommand) { $0.seek(by: -15) }
-        add(center.nextTrackCommand) { $0.nextChapter() }
-        add(center.previousTrackCommand) { $0.previousChapter() }
+        add(center.nextTrackCommand) { $0.moveSentence(by: 1) }
+        add(center.previousTrackCommand) { $0.moveSentence(by: -1) }
         center.changePlaybackRateCommand.supportedPlaybackRates = [0.5, 0.75, 1, 1.25, 1.5, 1.75, 2]
         let rateTarget = center.changePlaybackRateCommand.addTarget { [weak self] event in
             guard let value = event as? MPChangePlaybackRateCommandEvent else { return .commandFailed }
@@ -428,8 +560,8 @@ final class PlaybackController: NSObject, ObservableObject {
                                           center.skipForwardCommand, center.skipBackwardCommand, center.changePlaybackRateCommand,
                                           center.changePlaybackPositionCommand]
         for command in commands { command.isEnabled = active }
-        center.previousTrackCommand.isEnabled = active && snapshot.canGoToPreviousChapter
-        center.nextTrackCommand.isEnabled = active && snapshot.canGoToNextChapter
+        center.previousTrackCommand.isEnabled = active && snapshot.sentenceIndex > 0
+        center.nextTrackCommand.isEnabled = active && snapshot.sentenceIndex + 1 < (book?.sentences.count ?? 0)
     }
 
     private func observeAudioSession() {
@@ -440,13 +572,14 @@ final class PlaybackController: NSObject, ObservableObject {
             Task { @MainActor [weak self] in
                 guard let self else { return }
                 if type == AVAudioSession.InterruptionType.began.rawValue {
-                    let wasPlaying = self.shouldPlay
-                    self.pause()
-                    self.interruptedPlayback = wasPlaying
+                    self.audioSessionReady = false
+                    self.coordinator.interrupt()
+                    self.player?.pause()
+                    self.refreshSnapshot()
+                    self.saveCurrent()
                 } else if type == AVAudioSession.InterruptionType.ended.rawValue {
-                    let resume = self.interruptedPlayback && AVAudioSession.InterruptionOptions(rawValue: options).contains(.shouldResume)
-                    self.interruptedPlayback = false
-                    if resume && !self.shouldPlay { self.toggle() }
+                    let allowed = AVAudioSession.InterruptionOptions(rawValue: options).contains(.shouldResume)
+                    if self.coordinator.endInterruption(shouldResume: allowed) { self.resumeCurrent() }
                 }
             }
         })
@@ -457,12 +590,14 @@ final class PlaybackController: NSObject, ObservableObject {
             }
         })
         observers.append(notifications.addObserver(forName: UIApplication.didEnterBackgroundNotification, object: nil, queue: .main) { [weak self] _ in
-            Task { @MainActor [weak self] in self?.saveCurrent() }
+            Task { @MainActor [weak self] in self?.saveCurrent(final: true) }
         })
         observers.append(notifications.addObserver(forName: AVAudioSession.mediaServicesWereResetNotification, object: nil, queue: .main) { [weak self] _ in
             Task { @MainActor [weak self] in
                 guard let self, self.book != nil else { return }
                 let position = self.currentPosition()
+                self.audioSessionReady = false
+                self.resolvedVoice = nil
                 self.saveCurrent()
                 self.prepare(index: self.snapshot.sentenceIndex, offset: position, autoplay: self.shouldPlay)
             }
@@ -473,27 +608,29 @@ final class PlaybackController: NSObject, ObservableObject {
 extension PlaybackController: AVAudioPlayerDelegate {
     nonisolated func audioPlayerDidFinishPlaying(_ player: AVAudioPlayer, successfully flag: Bool) {
         Task { @MainActor [weak self] in
-            guard let self, self.player === player, let book = self.book else { return }
+            guard let self, self.player === player, let token = self.playerTicket, self.coordinator.accepts(token) else { return }
             self.snapshot.position = player.duration
-            self.saveCurrent(positionOverride: player.duration)
-            if flag && self.shouldPlay && self.snapshot.sentenceIndex + 1 < book.sentences.count {
-                self.pendingSeek = nil
-                self.prepare(index: self.snapshot.sentenceIndex + 1, offset: 0, autoplay: true)
-            } else {
-                self.shouldPlay = false
+            let completion = self.coordinator.complete(token, successfully: flag)
+            self.saveCurrent(positionOverride: player.duration, final: completion == .finished)
+            switch completion {
+            case .advance(let next):
+                if let preparation = self.coordinator.continueAfterCompletion(to: next) { self.execute(preparation) }
+            case .finished:
                 self.player?.delegate = nil
-                self.player = nil // AVAudioPlayer 完成后可能将 currentTime 归零，改为保留快照中的真实句末。
+                self.player = nil // 系统完成回调后 currentTime 可能归零，改用快照保存真实句末。
+                self.playerTicket = nil
                 self.snapshot.isPlaying = false
                 self.snapshot.chapterProgress = self.timeline?.fraction(at: self.snapshot.sentenceIndex, offset: player.duration, duration: player.duration) ?? 1
                 if !flag { self.snapshot.error = SpeechPlaybackError.invalidAudio.localizedDescription }
                 self.refreshSnapshot()
+            case .ignored: break
             }
         }
     }
 
     nonisolated func audioPlayerDecodeErrorDidOccur(_ player: AVAudioPlayer, error: Error?) {
         Task { @MainActor [weak self] in
-            guard let self, self.player === player else { return }
+            guard let self, self.player === player, let token = self.playerTicket, self.coordinator.accepts(token) else { return }
             self.fail(error ?? SpeechPlaybackError.invalidAudio)
         }
     }

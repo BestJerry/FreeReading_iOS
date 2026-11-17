@@ -24,8 +24,8 @@ struct EPUBImporter {
         if metadataNodes.contains(where: {
             ($0.attributes["property"] == "rendition:layout" && $0.text.trimmingCharacters(in: .whitespacesAndNewlines) == "pre-paginated") ||
             ($0.attributes["name"] == "fixed-layout" && $0.attributes["content"] == "true")
-        }) || spine.attributes["page-progression-direction"] == "rtl" {
-            throw BookError.invalid("暂不支持固定版式或从右向左排版的 EPUB")
+        }) {
+            throw BookError.invalid("暂不支持固定版式 EPUB")
         }
         var items: [String: Item] = [:]
         for node in manifest.children where node.name == "item" {
@@ -69,7 +69,9 @@ struct EPUBImporter {
         let coverID = metadataNodes.first(where: { $0.name == "meta" && $0.attributes["name"] == "cover" })?.attributes["content"]
         let cover = items.values.first(where: { $0.properties.contains("cover-image") }) ?? coverID.flatMap { items[$0] }
         let coverPath = cover.flatMap { item in item.mediaType.hasPrefix("image/") && files.fileExists(atPath: contentRoot.appendingPathComponent(item.href).path) ? "content/" + item.href : nil }
-        let record = BookRecord(id: id, title: title?.isEmpty == false ? String(title!.prefix(2048)) : "未命名书籍", author: String(author.prefix(2048)), language: language?.isEmpty == false ? String(language!.prefix(128)) : "zh-CN", coverPath: coverPath, chapterCount: chapters.count, sentenceCount: sentences.count)
+        // RTL 只改变页面前进方向，句子索引仍沿用 EPUB spine 和 DOM 的原始顺序。
+        let direction: ReadingDirection? = spine.attributes["page-progression-direction"] == "rtl" ? .rightToLeft : nil
+        let record = BookRecord(id: id, title: title?.isEmpty == false ? String(title!.prefix(2048)) : "未命名书籍", author: String(author.prefix(2048)), language: language?.isEmpty == false ? String(language!.prefix(128)) : "zh-CN", coverPath: coverPath, chapterCount: chapters.count, sentenceCount: sentences.count, readingDirection: direction)
         return SpeechBook(record: record, chapters: chapters, sections: sections, sentences: sentences, contents: contents.isEmpty ? chapters.map { ContentsEntry(id: "chapter-\($0.id)", title: $0.title, chapterIndex: $0.id) } : contents)
     }
 

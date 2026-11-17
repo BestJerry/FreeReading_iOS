@@ -24,10 +24,13 @@ struct VoiceOption: Identifiable, Equatable {
     let id: String
     let name: String
     let language: String
+    var availabilityText = "尚未验证可合成"
+    // 系统列表及一次联网合成都不等于离线能力，不能标成“已下载离线声音”。
+    var offlineText = "iOS 不提供可靠的离线音色筛选；离线使用请下载声音后断网验证。"
 }
 
 /// 用于播放和跨句时间定位的实际音频文件与秒数。
-struct CachedSpeechClip {
+struct CachedSpeechClip: Sendable {
     let url: URL
     let duration: Double
 }

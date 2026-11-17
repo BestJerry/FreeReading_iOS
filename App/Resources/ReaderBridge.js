@@ -1,7 +1,28 @@
 (function () {
     "use strict";
     if (window.FreeReading) return;
-    var paged = true, lastHighlight = null, scrollTimer = null, touch = null, selectionTimer = null, navigationRevision = 0;
+    var paged = true, rtl = false, lastHighlight = null, scrollTimer = null, touch = null, selectionTimer = null, navigationRevision = 0;
+    // EPUB 常未声明移动端视口；否则 iOS 使用约 980px 的布局宽度，20px 正文会整体缩小。
+    // XHTML 必须使用 HTML 命名空间创建 meta，且不限制用户放大手势。
+    function ensureViewport() {
+        var namespace = "http://www.w3.org/1999/xhtml";
+        var head = document.head || document.documentElement.querySelector("head");
+        if (!head) {
+            head = document.createElementNS(namespace, "head");
+            document.documentElement.insertBefore(head, document.documentElement.firstChild);
+        }
+        var existing = Array.from(head.querySelectorAll("meta[name]")).filter(function (meta) {
+            return meta.getAttribute("name").trim().toLowerCase() === "viewport";
+        });
+        var viewport = existing.find(function (meta) { return meta.namespaceURI === namespace; });
+        if (!viewport) viewport = document.createElementNS(namespace, "meta");
+        existing.forEach(function (meta) { if (meta !== viewport) meta.remove(); });
+        if (viewport.getAttribute("name") !== "viewport") viewport.setAttribute("name", "viewport");
+        var content = "width=device-width, initial-scale=1";
+        if (viewport.getAttribute("content") !== content) viewport.setAttribute("content", content);
+        if (!viewport.parentNode) head.appendChild(viewport);
+    }
+    ensureViewport();
     var style = document.createElement("style");
     style.id = "fr-reader-style";
     document.head.appendChild(style);
@@ -39,11 +60,20 @@
         return rect.width > 0 && rect.height > 0 && rect.right > 1 && rect.left < innerWidth - 1 &&
             rect.bottom > 1 && rect.top < innerHeight - 1;
     }
-    function progress() {
+    // WebKit 的 RTL 横向滚动坐标为负数；所有页码与进度统一转换为从章首开始的正坐标。
+    function maximumPosition() {
         var scroller = document.scrollingElement;
-        var total = paged ? scroller.scrollWidth - innerWidth : scroller.scrollHeight - innerHeight;
-        var position = paged ? scrollX : scrollY;
-        return total > 0 ? Math.min(1, Math.max(0, position / total)) : 0;
+        return Math.max(0, paged ? scroller.scrollWidth - innerWidth : scroller.scrollHeight - innerHeight);
+    }
+    function readingPosition() { return Math.min(maximumPosition(), Math.max(0, paged ? (rtl ? -scrollX : scrollX) : scrollY)); }
+    function scrollToPosition(position) {
+        var value = Math.min(maximumPosition(), Math.max(0, position));
+        if (paged) scrollTo({left: rtl ? -value : value, top: 0, behavior: "instant"});
+        else scrollTo({left: 0, top: value, behavior: "instant"});
+    }
+    function progress() {
+        var total = maximumPosition();
+        return total > 0 ? readingPosition() / total : 0;
     }
     // 使用 DOM 中的原始 UTF-16 字符范围，不把浏览器页进度换算成正文比例。
     function anchor() {
@@ -57,7 +87,7 @@
             var middle = Math.floor((low + high) / 2);
             var range = textRange(found, middle, middle + 1);
             var rect = range && range.getBoundingClientRect();
-            var before = rect && (paged ? rect.right <= 1 : rect.bottom <= 1);
+            var before = rect && (paged ? (rtl ? rect.left >= innerWidth - 1 : rect.right <= 1) : rect.bottom <= 1);
             if (before) low = middle + 1; else high = middle;
         }
         return {sectionID: Number(found.getAttribute("data-fr-section")), offset: low, progress: progress()};
@@ -103,23 +133,27 @@
     function locate(rect) {
         if (!rect) return;
         if (paged) {
-            var page = Math.floor((rect.left + scrollX + 0.5) / Math.max(1, innerWidth));
-            scrollTo({left: page * innerWidth, top: 0, behavior: "instant"});
+            var coordinate = rtl ? innerWidth - rect.right - scrollX : rect.left + scrollX;
+            var page = Math.floor((coordinate + 0.5) / Math.max(1, innerWidth));
+            scrollToPosition(page * innerWidth);
         } else {
-            scrollTo({left: 0, top: Math.max(0, rect.top + scrollY - 26), behavior: "instant"});
+            scrollToPosition(rect.top + scrollY - 26);
         }
     }
     function navigate(target) {
         navigationRevision += 1;
         if (target.kind === "progress") {
-            var scroller = document.scrollingElement;
             if (paged) {
-                var last = Math.max(0, Math.ceil(scroller.scrollWidth / innerWidth) - 1);
-                scrollTo(Math.round(last * target.value) * innerWidth, 0);
-            } else scrollTo(0, Math.max(0, scroller.scrollHeight - innerHeight) * target.value);
+                var last = Math.max(0, Math.round(maximumPosition() / Math.max(1, innerWidth)));
+                scrollToPosition(Math.round(last * Math.min(1, Math.max(0, target.value))) * innerWidth);
+            } else scrollToPosition(maximumPosition() * Math.min(1, Math.max(0, target.value)));
         } else if (target.kind === "fragment") {
             var element = document.getElementById(target.value);
-            if (element) locate(element.getBoundingClientRect());
+            if (element) {
+                var fragmentRange = document.createRange();
+                fragmentRange.selectNodeContents(element);
+                locate(Array.from(fragmentRange.getClientRects()).find(function (rect) { return rect.width > 0 && rect.height > 0; }) || element.getBoundingClientRect());
+            }
         } else if (target.kind === "section") {
             var block = section(target.sectionID);
             if (block) {
@@ -149,13 +183,16 @@
     }
     function configure(options) {
         var previous = anchor();
+        ensureViewport();
         paged = !options.scroll;
+        rtl = options.direction === "rtl";
+        document.documentElement.setAttribute("dir", rtl ? "rtl" : "ltr");
         document.documentElement.classList.toggle("fr-paged", paged);
         document.documentElement.classList.toggle("fr-scroll", !paged);
         var paper = options.paper || "#f7f5ef", ink = options.ink || "#283c32";
         style.textContent =
-            "html{background:" + paper + "!important;color:" + ink + "!important;overflow-anchor:none;}" +
-            "body{background:" + paper + "!important;color:" + ink + "!important;font-size:" + options.fontSize + "px!important;line-height:1.85!important;-webkit-text-size-adjust:100%!important;word-wrap:break-word;}" +
+            "html{background:" + paper + "!important;color:" + ink + "!important;overflow-anchor:none;direction:" + (rtl ? "rtl" : "ltr") + "!important;}" +
+            "body{background:" + paper + "!important;color:" + ink + "!important;direction:" + (rtl ? "rtl" : "ltr") + "!important;font-family:ui-serif,serif!important;font-size:" + options.fontSize + "px!important;line-height:1.8!important;-webkit-text-size-adjust:100%!important;word-wrap:break-word;}" +
             "html.fr-paged{height:100%;overflow-x:auto;overflow-y:hidden;}html.fr-paged body{box-sizing:content-box!important;margin:0!important;padding:24px 28px!important;width:calc(100vw - 56px)!important;height:calc(100vh - 48px)!important;column-width:calc(100vw - 56px)!important;column-gap:56px!important;column-fill:auto!important;overflow:visible!important;}" +
             "html.fr-scroll{overflow-x:hidden;overflow-y:auto;}html.fr-scroll body{box-sizing:border-box!important;width:100%!important;margin:0!important;padding:24px 28px!important;}" +
             "img,svg,video{max-width:100%!important;height:auto!important;}html.fr-paged img{max-height:85vh!important;object-fit:contain;}" +
@@ -183,7 +220,7 @@
     }, true);
     document.addEventListener("touchstart", function (event) {
         var p = event.touches[0];
-        touch = {x: p.clientX, y: p.clientY, scroll: scrollX, time: Date.now(), moved: false};
+        touch = {x: p.clientX, y: p.clientY, scroll: readingPosition(), time: Date.now(), moved: false};
     }, {passive: true});
     document.addEventListener("touchmove", function (event) {
         if (!touch) return;
@@ -196,9 +233,9 @@
         if (!touch || !event.changedTouches.length) return;
         var p = event.changedTouches[0], dx = p.clientX - touch.x, dy = p.clientY - touch.y;
         if (Math.abs(dx) > 65 && Math.abs(dx) > Math.abs(dy) * 1.4) {
-            var maximum = Math.max(0, document.scrollingElement.scrollWidth - innerWidth);
-            if (!paged || (dx < 0 && touch.scroll >= maximum - 3) || (dx > 0 && touch.scroll <= 3)) {
-                post("chapter", {delta: dx < 0 ? 1 : -1});
+            var delta = (dx < 0 ? 1 : -1) * (rtl ? -1 : 1);
+            if (!paged || (delta > 0 && touch.scroll >= maximumPosition() - 3) || (delta < 0 && touch.scroll <= 3)) {
+                post("chapter", {delta: delta});
             }
         }
     }, {passive: true});

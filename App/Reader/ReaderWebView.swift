@@ -19,7 +19,7 @@ struct ReaderAnchor: Equatable {
 
 /// 通过独立命令标识重放导航，避免页面加载后丢失同一句的重新起播请求。
 struct ReaderNavigation: Equatable {
-    enum Target: Equatable { case progress(Double), section(Int, Int), fragment(String) }
+    typealias Target = ReaderLocationTarget
     var id = UUID()
     var target: Target
     var json: [String: Any] {
@@ -48,13 +48,14 @@ struct ReaderAppearance: Equatable {
     var fontSize: Double
     var theme: String
     var scroll: Bool
-    var paper: String { theme == "night" ? "#18231e" : theme == "white" ? "#ffffff" : "#f7f5ef" }
-    var ink: String { theme == "night" ? "#cbd7cb" : "#283c32" }
-    var json: [String: Any] { ["fontSize": fontSize, "paper": paper, "ink": ink, "scroll": scroll] }
+    var direction: ReadingDirection = .leftToRight
+    var paper: String { ReadingColors(theme: theme).paperHex }
+    var ink: String { ReadingColors(theme: theme).inkHex }
+    var json: [String: Any] { ["fontSize": fontSize, "paper": paper, "ink": ink, "scroll": scroll, "direction": direction == .rightToLeft ? "rtl" : "ltr"] }
 }
 
 enum ReaderWebEvent {
-    case ready, tap, manual, chapter(Int), anchor(ReaderAnchor), selection(Bool), link(String), failure(String), listenSelection
+    case ready, tap, manual, chapter(Int), anchor(ReaderAnchor), selection(Bool), link(String), failure(String), listenSelection, navigationApplied(UUID)
 }
 
 /// 仅加载书籍私有目录。书内脚本由导入层移除，网络子资源另由 WebKit 内容规则阻断。
@@ -67,6 +68,7 @@ struct ReaderWebView: UIViewRepresentable {
     let highlight: ReaderHighlight?
     let onAttach: (WKWebView) -> Void
     let onEvent: (ReaderWebEvent) -> Void
+    var onDismantle: () -> Void = {}
 
     func makeCoordinator() -> Coordinator { Coordinator(self) }
 
@@ -117,6 +119,8 @@ struct ReaderWebView: UIViewRepresentable {
     }
 
     static func dismantleUIView(_ uiView: ReadingWKWebView, coordinator: Coordinator) {
+        // 仅真正释放原文时结束会话；全屏播放器遮挡不应触发关闭。
+        coordinator.parent.onDismantle()
         uiView.stopLoading()
         uiView.configuration.userContentController.removeScriptMessageHandler(forName: "freeReading")
         uiView.navigationDelegate = nil
@@ -142,6 +146,9 @@ struct ReaderWebView: UIViewRepresentable {
         func update() {
             guard rulesReady, let web else { return }
             web.scrollView.isPagingEnabled = !parent.appearance.scroll
+            // 页序由 EPUB 的 spine 方向决定，不能随手机界面语言二次镜像。
+            web.semanticContentAttribute = .forceLeftToRight
+            web.scrollView.semanticContentAttribute = .forceLeftToRight
             if loadedURL != parent.url {
                 generation += 1
                 renderTask?.cancel()
@@ -162,6 +169,7 @@ struct ReaderWebView: UIViewRepresentable {
                     let navigation = self.parent.navigation
                     let highlight = self.parent.highlight
                     var script: [String] = []
+                    var issuedNavigation: UUID?
                     if self.appliedAppearance != appearance {
                         script.append("window.FreeReading.configure(" + Self.json(appearance.json) + ");")
                         self.appliedAppearance = appearance
@@ -169,6 +177,7 @@ struct ReaderWebView: UIViewRepresentable {
                     if let navigation, self.appliedNavigation != navigation.id {
                         script.append("window.FreeReading.navigate(" + Self.json(navigation.json) + ");")
                         self.appliedNavigation = navigation.id
+                        issuedNavigation = navigation.id
                     }
                     if self.appliedHighlight != highlight {
                         script.append("window.FreeReading.highlight(" + (highlight.map { Self.json($0.json) } ?? "null") + ");")
@@ -177,6 +186,7 @@ struct ReaderWebView: UIViewRepresentable {
                     if script.isEmpty { break }
                     do {
                         _ = try await ReaderJavaScript.evaluate("if(window.FreeReading){" + script.joined() + "}", in: web)
+                        if self.generation == token, let issuedNavigation { self.parent.onEvent(.navigationApplied(issuedNavigation)) }
                     } catch {
                         if self.generation == token && !Task.isCancelled {
                             self.parent.onEvent(.failure("阅读页面更新失败，请返回书架后重试。"))
