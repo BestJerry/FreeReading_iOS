@@ -1,0 +1,12 @@
+.DS_Store
+.build/
+DerivedData/
+.build-ios/
+*.xcuserstate
+xcuserdata/
+*.ipa
+*.xcarchive
+*.mobileprovision
+*.p12
+.env
+.swiftpm/
