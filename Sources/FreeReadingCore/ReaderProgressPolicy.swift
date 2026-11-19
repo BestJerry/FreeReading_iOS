@@ -8,6 +8,10 @@ public enum ReaderLocationTarget: Equatable, Sendable {
 /// 阅读器与存储共用的纯规则；正文游标、音频游标和视觉分页比例不能相互替代。
 public enum ReaderProgressPolicy {
     private static let fragmentPrefix = "fr-fragment:"
+    /// 正在播放或准备时优先切换暂停意图；手动浏览只影响暂停后的下一次起播位置。
+    public static func shouldToggleExistingAudio(ownsAudio: Bool, wantsPlayback: Bool, isPreparing: Bool, fromReading: Bool) -> Bool {
+        ownsAudio && (wantsPlayback || isPreparing || !fromReading)
+    }
     /// 按各章正文长度加权，与 Android 的全书位置进度采用同一原则：短扉页不占一整章的权重。
     /// 权重只描述正文规模，章内仍使用排版后的视觉比例，因此它不是精确的逐字位置。
     public static func totalProgress(chapterIndex: Int, pageProgress: Double, chapterWeights: [Double], chapterCount: Int) -> Double {

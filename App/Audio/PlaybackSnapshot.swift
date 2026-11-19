@@ -1,4 +1,5 @@
 import Foundation
+import FreeReadingCore
 
 /// 播放服务对外的不可变快照；章节进度表示正文位置，不假设整章音频已生成。
 struct PlaybackSnapshot: Equatable {
@@ -17,6 +18,7 @@ struct PlaybackSnapshot: Equatable {
     var voiceName = "自动选择"
     var canGoToPreviousChapter = false
     var canGoToNextChapter = false
+    var followRequest: PlaybackFollowRequest?
 }
 
 /// 来自系统已提供的声音；iOS 不公开逐个声音是否需要下载的可靠标志。

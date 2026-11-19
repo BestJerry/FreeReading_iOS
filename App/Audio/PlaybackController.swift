@@ -67,14 +67,17 @@ final class PlaybackController: NSObject, ObservableObject {
         if changedBook { timeline = nil; resolvedVoice = nil; artwork = nil; loadArtwork(for: newBook) }
         coordinator.open(bookID: newBook.record.id, addedAt: newBook.record.addedAt, sentenceCount: newBook.sentences.count)
         prepare(index: min(max(0, sentenceIndex), newBook.sentences.count - 1), offset: offset, autoplay: true)
+        requestFollowingForPlaybackStart()
     }
 
     /// 准备期间也记录最新播放意图；音频到达时以协调器中的最新暂停意图为准。
     func toggle() {
         guard book != nil else { return }
         if snapshot.isPreparing {
-            coordinator.setPlaybackIntent(!shouldPlay)
+            let resuming = !shouldPlay
+            coordinator.setPlaybackIntent(resuming)
             refreshSnapshot()
+            if resuming { requestFollowingForPlaybackStart() }
         } else if shouldPlay && player?.isPlaying == true {
             pause()
         } else {
@@ -84,6 +87,7 @@ final class PlaybackController: NSObject, ObservableObject {
 
     private func resumeCurrent() {
         coordinator.setPlaybackIntent(true)
+        requestFollowingForPlaybackStart()
         if snapshot.isPreparing { refreshSnapshot(); return }
         if coordinator.canResumeInstalledPlayer, let player, player.currentTime < max(0, player.duration - 0.02) {
             do {
@@ -215,13 +219,24 @@ final class PlaybackController: NSObject, ObservableObject {
         guard let target else { return }
         saveCurrent()
         prepare(index: target, offset: 0, autoplay: true)
+        requestFollowingForPlaybackStart()
     }
 
     /// 锁屏和耳机的上一项／下一项按句切换，App 内独立的章按钮仍然从章首开播。
     private func moveSentence(by delta: Int) {
         guard book != nil else { return }
         saveCurrent()
-        if let preparation = coordinator.moveSentence(by: delta, from: snapshot.sentenceIndex) { execute(preparation) }
+        if let preparation = coordinator.moveSentence(by: delta, from: snapshot.sentenceIndex) {
+            execute(preparation)
+            if shouldPlay { requestFollowingForPlaybackStart() }
+        }
+    }
+
+    /// 所有页面及锁屏／耳机共用此入口；写回偏好，使阅读页尚未打开时的恢复也能生效。
+    private func requestFollowingForPlaybackStart() {
+        guard let book else { return }
+        UserDefaults.standard.set(true, forKey: PlaybackFollowRequest.preferenceKey)
+        snapshot.followRequest = PlaybackFollowRequest(bookID: book.record.id, addedAt: book.record.addedAt)
     }
 
     private func prepare(index: Int, offset: Double, autoplay: Bool?) {

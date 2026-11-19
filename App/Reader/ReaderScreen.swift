@@ -16,7 +16,7 @@ struct ReaderScreen: View {
     @AppStorage("reader.fontSize") private var fontSize = 20.0
     @AppStorage("reader.theme") private var theme = "paper"
     @AppStorage("reader.scroll") private var scroll = false
-    @AppStorage("reader.followAudio") private var followAudio = true
+    @AppStorage(PlaybackFollowRequest.preferenceKey) private var followAudio = true
     @State private var sheet: ReaderSheet?
     @State private var playerPresented = false
     @State private var didOpen = false
@@ -36,6 +36,13 @@ struct ReaderScreen: View {
     private var activeAudio: Bool { playback.snapshot.bookID == book.record.id && playback.book?.record.addedAt == book.record.addedAt }
     private var percent: Int { Int(min(1, max(0, session.readingFraction)) * 100) }
     private var followingAudio: Bool { followAudio && !session.detached }
+    // 只在用户操作开关时恢复定位；播放器自动写偏好由独立起播事件处理。
+    private var followBinding: Binding<Bool> {
+        Binding(get: { followAudio }, set: { enabled in
+            followAudio = enabled
+            session.setFollow(enabled)
+        })
+    }
 
     var body: some View {
         ZStack(alignment: .top) {
@@ -88,14 +95,14 @@ struct ReaderScreen: View {
                 .presentationDetents([.medium, .large]).presentationDragIndicator(.visible)
                 .presentationBackground(colors.paper)
             case .settings:
-                ReaderSettingsSheet(fontSize: $fontSize, theme: $theme, scroll: $scroll, followAudio: $followAudio)
+                ReaderSettingsSheet(fontSize: $fontSize, theme: $theme, scroll: $scroll, followAudio: followBinding)
                     .presentationDetents([.medium, .large]).presentationDragIndicator(.visible)
                     .presentationBackground(colors.paper)
             }
         }
         .fullScreenCover(isPresented: $playerPresented, onDismiss: { session.applyAudio() }) {
             ListeningScreen(book: book, repository: repository, theme: theme, readingReady: session.ready, playback: playback,
-                followAudio: $followAudio, detached: session.detached, isLoadingSpeech: session.isLoadingSpeech,
+                followAudio: followBinding, detached: session.detached, isLoadingSpeech: session.isLoadingSpeech,
                 onMainAction: session.primaryPlayback, onFromReading: session.startFromVisible,
                 onPreviousChapter: { session.skipListeningChapter(forward: false) },
                 onNextChapter: { session.skipListeningChapter(forward: true) },
@@ -107,6 +114,7 @@ struct ReaderScreen: View {
         .task {
             // 返回原文仍恢复可接收事件的会话；只在首次打开时自动进入播放器。
             session.open(follow: followAudio)
+            session.followNewPlaybackStart()
             if !didOpen {
                 didOpen = true
                 if openPlayer { playerPresented = true }
@@ -117,7 +125,10 @@ struct ReaderScreen: View {
         .onChange(of: playback.snapshot.bookID) { _, _ in session.applyAudio() }
         .onChange(of: playback.snapshot.sentenceIndex) { _, _ in session.applyAudio() }
         .onChange(of: playback.snapshot.isPlaying) { _, _ in session.applyAudio() }
-        .onChange(of: followAudio) { _, value in session.setFollow(value) }
+        .onChange(of: followAudio) { _, value in session.synchronizeFollowPreference(value) }
+        .onChange(of: playback.snapshot.followRequest) { _, _ in
+            session.followNewPlaybackStart()
+        }
         .onChange(of: scenePhase) { _, phase in
             if phase == .active { session.applyAudio() } else { session.saveNow() }
         }
@@ -198,7 +209,7 @@ struct ReaderScreen: View {
             if activeAudio {
                 Button {
                     if followAudio && session.detached { session.resumeFollowing() }
-                    else { followAudio.toggle() }
+                    else { followBinding.wrappedValue = !followAudio }
                 } label: {
                     Text(followingAudio ? "自动翻页" : "继续跟随")
                         .font(.system(size: 11)).lineLimit(1).fixedSize(horizontal: true, vertical: false)

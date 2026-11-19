@@ -39,9 +39,12 @@ final class ReaderSession: ObservableObject {
     private var needsLegacyRestore = false
     private var closed = false
     var followAudio = true
+    private var lastFollowRequest: PlaybackFollowRequest?
 
     init(bootstrap: ReadingBookBootstrap, repository: BookRepository, playback: PlaybackController) {
         book = bootstrap.book; self.repository = repository; self.playback = playback
+        // 已存在的播放事件不因重开页面重复消费；关闭期间的新起播已写回共享偏好。
+        lastFollowRequest = playback.snapshot.followRequest
         speechBook = bootstrap.cachedSpeechBook
         restore(bootstrap.progress)
     }
@@ -168,6 +171,7 @@ final class ReaderSession: ObservableObject {
     }
 
     func markManualNavigation() {
+        acknowledgeCurrentFollowRequest()
         revision += 1; restorationComplete = true
         cancelStart(); saveTask?.cancel()
         detached = true; fromReading = true; resumeProgress = nil
@@ -192,16 +196,48 @@ final class ReaderSession: ObservableObject {
 
     func resumeFollowing() {
         guard ownsAudio else { return }
+        acknowledgeCurrentFollowRequest()
         cancelStart(); revision += 1
         detached = false; fromReading = false; resumeProgress = nil
         applyAudio()
     }
 
-    func setFollow(_ enabled: Bool) { followAudio = enabled; if enabled { resumeFollowing() } else { applyAudio() } }
+    /// 用户主动切换时立即生效，并消费此前已发布的起播事件，避免迟到回调覆盖操作。
+    func setFollow(_ enabled: Bool) {
+        acknowledgeCurrentFollowRequest()
+        followAudio = enabled
+        if enabled { resumeFollowing() } else { applyAudio() }
+    }
+
+    /// AppStorage 也会由播放器写入；同步偏好不代表用户要求跳回原文。
+    func synchronizeFollowPreference(_ enabled: Bool) { followAudio = enabled; applyAudio() }
+
+    private func acknowledgeCurrentFollowRequest() {
+        guard let request = playback.snapshot.followRequest,
+              request.bookID == book.record.id, request.addedAt == book.record.addedAt else { return }
+        lastFollowRequest = request
+    }
+
+    /// 起播事件独立于每句状态；不取消刚发起的起播查询，也不把暂停或自然换句当作新开始。
+    @discardableResult
+    func followNewPlaybackStart() -> Bool {
+        guard !closed, let request = playback.snapshot.followRequest,
+              let enabled = request.followingPreference(bookID: book.record.id, addedAt: book.record.addedAt, after: lastFollowRequest,
+                  currentPreference: UserDefaults.standard.object(forKey: PlaybackFollowRequest.preferenceKey) as? Bool ?? true) else { return false }
+        lastFollowRequest = request
+        followAudio = enabled
+        if enabled {
+            detached = false
+            if startID == nil { fromReading = false; resumeProgress = nil }
+        }
+        applyAudio()
+        return enabled
+    }
 
     /// 同书现有音频直接切换播放意图；新起播才等待完整索引并重验用户导航代次。
     func primaryPlayback() {
-        if ownsAudio && !fromReading {
+        if ReaderProgressPolicy.shouldToggleExistingAudio(ownsAudio: ownsAudio,
+            wantsPlayback: playback.snapshot.wantsPlayback, isPreparing: playback.snapshot.isPreparing, fromReading: fromReading) {
             cancelStart(); playback.toggle(); applyAudio(); return
         }
         guard !fromReading, let progress = resumeProgress else { startFromVisible(); return }
