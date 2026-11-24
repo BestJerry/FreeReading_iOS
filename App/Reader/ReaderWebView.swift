@@ -39,7 +39,7 @@ struct ReaderHighlight: Equatable {
     var navigate: Bool
     var revision: Int
     var json: [String: Any] {
-        ["sectionID": section, "start": start, "end": end, "navigate": navigate]
+        ["sentenceIndex": sentence, "sectionID": section, "start": start, "end": end, "navigate": navigate]
     }
 }
 
@@ -55,7 +55,8 @@ struct ReaderAppearance: Equatable {
 }
 
 enum ReaderWebEvent {
-    case ready, tap, manual, chapter(Int), anchor(ReaderAnchor), selection(Bool), link(String), failure(String), listenSelection, navigationApplied(UUID)
+    case ready, tap, anchor(ReaderAnchor), selection(Bool), link(String), failure(String), listenSelection, navigationApplied(UUID)
+    case manual(source: URL, shownSentence: Int?), chapter(Int, source: URL, shownSentence: Int?)
 }
 
 /// 仅加载书籍私有目录。书内脚本由导入层移除，网络子资源另由 WebKit 内容规则阻断。
@@ -232,14 +233,17 @@ struct ReaderWebView: UIViewRepresentable {
 
         func userContentController(_ userContentController: WKUserContentController, didReceive message: WKScriptMessage) {
             guard message.frameInfo.isMainFrame, message.webView === web,
-                  message.frameInfo.request.url?.standardizedFileURL == parent.url.standardizedFileURL,
+                  let source = message.frameInfo.request.url?.standardizedFileURL,
+                  source == parent.url.standardizedFileURL,
                   let body = message.body as? [String: Any], let type = body["type"] as? String else { return }
             let value = body["value"] as? [String: Any] ?? [:]
             switch type {
             case "tap": parent.onEvent(.tap)
-            case "manual": parent.onEvent(.manual)
+            case "manual": parent.onEvent(.manual(source: source, shownSentence: value["shownSentence"] as? Int))
             case "chapter":
-                if let delta = value["delta"] as? Int, delta == 1 || delta == -1 { parent.onEvent(.chapter(delta)) }
+                if let delta = value["delta"] as? Int, delta == 1 || delta == -1 {
+                    parent.onEvent(.chapter(delta, source: source, shownSentence: value["shownSentence"] as? Int))
+                }
             case "anchor", "ready":
                 if let anchor = ReaderAnchor(value) { parent.onEvent(.anchor(anchor)) }
             case "selection":

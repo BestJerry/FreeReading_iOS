@@ -16,7 +16,6 @@ final class ReaderSession: ObservableObject {
     @Published var navigation: ReaderNavigation?
     @Published var highlight: ReaderHighlight?
     @Published var menuVisible = false
-    @Published var detached = false
     @Published var ready = false
     @Published var selectionActive = false
     @Published var pageProgress = 0.0
@@ -27,6 +26,8 @@ final class ReaderSession: ObservableObject {
     private var pendingNavigation: ReaderNavigation?
     private var resumeProgress: ReadingProgress?
     private var fromReading = false
+    // 手动翻页后，本句及下一句的准备阶段先留在手动页。
+    private var audioNavigationDeferral: ReaderAudioNavigationDeferral?
     private var revision = 0
     private var highlightRevision = 0
     private var startID: UUID?
@@ -38,13 +39,9 @@ final class ReaderSession: ObservableObject {
     private var restorationComplete = false
     private var needsLegacyRestore = false
     private var closed = false
-    var followAudio = true
-    private var lastFollowRequest: PlaybackFollowRequest?
 
     init(bootstrap: ReadingBookBootstrap, repository: BookRepository, playback: PlaybackController) {
         book = bootstrap.book; self.repository = repository; self.playback = playback
-        // 已存在的播放事件不因重开页面重复消费；关闭期间的新起播已写回共享偏好。
-        lastFollowRequest = playback.snapshot.followRequest
         speechBook = bootstrap.cachedSpeechBook
         restore(bootstrap.progress)
     }
@@ -79,8 +76,10 @@ final class ReaderSession: ObservableObject {
         playback.snapshot.bookID == book.record.id && playback.book?.record.addedAt == book.record.addedAt
     }
 
-    func open(follow: Bool) {
-        closed = false; followAudio = follow
+    private var isFollowingPlayback: Bool { ownsAudio && playback.snapshot.wantsPlayback }
+
+    func open() {
+        closed = false
         guard needsLegacyRestore else {
             restorationComplete = true; applyAudio(); return
         }
@@ -121,10 +120,20 @@ final class ReaderSession: ObservableObject {
                 }
             } else { applyAudio() }
         case .tap: menuVisible.toggle()
-        case .manual: markManualNavigation()
-        case .chapter(let delta): moveChapter(delta)
+        case .manual(let source, let shownSentence):
+            guard source == chapterURL?.standardizedFileURL else { return }
+            markManualNavigation(shownSentence: shownSentence)
+            // 浏览器事件可能晚于下一句开播；此时即使没有另一条播放通知也应立即同步。
+            if shownSentence != nil { applyAudio() }
+        case .chapter(let delta, let source, let shownSentence):
+            guard source == chapterURL?.standardizedFileURL else { return }
+            moveChapter(delta, shownSentence: shownSentence)
         case .anchor(let value): acceptAnchor(value)
-        case .selection(let active): selectionActive = active
+        case .selection(let active):
+            guard selectionActive != active else { return }
+            selectionActive = active
+            if active, startID == nil { markManualNavigation(deferAudio: false) }
+            applyAudio()
         case .link(let href): openLink(href)
         case .failure(let message): error = message
         case .listenSelection: startFromSelection()
@@ -154,90 +163,98 @@ final class ReaderSession: ObservableObject {
         }
     }
 
-    /// 快照中的句子是唯一同步依据；手动浏览保留高亮更新，但暂时停止自动跳页。
+    /// 朗读意图在句间准备时延续；选文和起播定位完成后再把页面交回当前朗读句。
     func applyAudio() {
         guard !closed else { return }
         let snapshot = playback.snapshot
+        if let deferral = audioNavigationDeferral,
+           !deferral.shouldWait(wantsPlayback: isFollowingPlayback, isPlaying: snapshot.isPlaying, sentenceIndex: snapshot.sentenceIndex) {
+            audioNavigationDeferral = nil
+        }
         guard ownsAudio, let indexedBook, indexedBook.sentences.indices.contains(snapshot.sentenceIndex) else {
             highlight = nil; return
         }
         let sentence = indexedBook.sentences[snapshot.sentenceIndex]
-        let shouldNavigate = followAudio && !detached && startID == nil && !fromReading
-        if shouldNavigate { revision += 1; setChapter(sentence.chapterIndex) }
+        let shouldNavigate = isFollowingPlayback && audioNavigationDeferral == nil && startID == nil && !selectionActive
+        if shouldNavigate {
+            revision += 1
+            fromReading = false
+            resumeProgress = nil
+            navigation = nil
+            pendingNavigation = nil
+            setChapter(sentence.chapterIndex)
+        }
         guard sentence.chapterIndex == chapterIndex else { highlight = nil; return }
         highlightRevision += 1
-        highlight = ReaderHighlight(sentence: sentence.id, section: sentence.sectionID,
+        highlight = ReaderHighlight(sentence: snapshot.sentenceIndex, section: sentence.sectionID,
             start: sentence.range.start, end: sentence.range.end, navigate: shouldNavigate, revision: highlightRevision)
     }
 
-    func markManualNavigation() {
-        acknowledgeCurrentFollowRequest()
-        revision += 1; restorationComplete = true
-        cancelStart(); saveTask?.cancel()
-        detached = true; fromReading = true; resumeProgress = nil
-        navigation = nil; pendingNavigation = nil
-        if var existing = highlight { existing.navigate = false; highlight = existing }
+    func audioDidStartPlaying() {
+        if audioNavigationDeferral != nil { applyAudio() }
     }
 
-    func moveChapter(_ delta: Int) {
+    func markManualNavigation(deferAudio: Bool = true, shownSentence: Int? = nil) {
+        revision += 1; restorationComplete = true
+        cancelStart(); saveTask?.cancel()
+        if isFollowingPlayback {
+            if deferAudio {
+                let snapshot = playback.snapshot
+                if let shownSentence {
+                    audioNavigationDeferral = .readingSentence(shownSentence)
+                } else if snapshot.isPlaying {
+                    audioNavigationDeferral = .readingSentence(snapshot.sentenceIndex)
+                } else if audioNavigationDeferral == nil {
+                    audioNavigationDeferral = .waitingForPlayback
+                }
+            }
+        } else {
+            fromReading = true
+            resumeProgress = nil
+        }
+        navigation = nil; pendingNavigation = nil
+        if var current = highlight, current.navigate {
+            current.navigate = false
+            highlight = current
+        }
+    }
+
+    func moveChapter(_ delta: Int, shownSentence: Int?) {
         let target = chapterIndex + delta
         guard book.chapters.indices.contains(target) else { return }
-        markManualNavigation(); setChapter(target)
+        markManualNavigation(shownSentence: shownSentence)
+        setChapter(target)
         issueNavigation(.progress(delta > 0 ? 0 : 1))
         menuVisible = false; applyAudio()
     }
 
     func chooseContents(_ entry: ContentsEntry) {
         guard book.chapters.indices.contains(entry.chapterIndex) else { return }
-        markManualNavigation(); setChapter(entry.chapterIndex)
+        markManualNavigation()
+        menuVisible = false
+        setChapter(entry.chapterIndex)
         issueNavigation(entry.fragment.map(ReaderNavigation.Target.fragment) ?? .progress(0))
-        currentContentsID = entry.id; menuVisible = false; applyAudio()
+        currentContentsID = entry.id
+        applyAudio()
     }
 
-    func resumeFollowing() {
-        guard ownsAudio else { return }
-        acknowledgeCurrentFollowRequest()
+    /// 暂停时也可主动定位到已有音频的句子。
+    func locateCurrentAudio() {
+        let snapshot = playback.snapshot
+        guard ownsAudio, let indexedBook, indexedBook.sentences.indices.contains(snapshot.sentenceIndex) else { return }
+        let sentence = indexedBook.sentences[snapshot.sentenceIndex]
         cancelStart(); revision += 1
-        detached = false; fromReading = false; resumeProgress = nil
+        audioNavigationDeferral = nil
+        fromReading = false; resumeProgress = nil
+        setChapter(sentence.chapterIndex)
+        issueNavigation(.section(sentence.sectionID, sentence.range.start))
         applyAudio()
-    }
-
-    /// 用户主动切换时立即生效，并消费此前已发布的起播事件，避免迟到回调覆盖操作。
-    func setFollow(_ enabled: Bool) {
-        acknowledgeCurrentFollowRequest()
-        followAudio = enabled
-        if enabled { resumeFollowing() } else { applyAudio() }
-    }
-
-    /// AppStorage 也会由播放器写入；同步偏好不代表用户要求跳回原文。
-    func synchronizeFollowPreference(_ enabled: Bool) { followAudio = enabled; applyAudio() }
-
-    private func acknowledgeCurrentFollowRequest() {
-        guard let request = playback.snapshot.followRequest,
-              request.bookID == book.record.id, request.addedAt == book.record.addedAt else { return }
-        lastFollowRequest = request
-    }
-
-    /// 起播事件独立于每句状态；不取消刚发起的起播查询，也不把暂停或自然换句当作新开始。
-    @discardableResult
-    func followNewPlaybackStart() -> Bool {
-        guard !closed, let request = playback.snapshot.followRequest,
-              let enabled = request.followingPreference(bookID: book.record.id, addedAt: book.record.addedAt, after: lastFollowRequest,
-                  currentPreference: UserDefaults.standard.object(forKey: PlaybackFollowRequest.preferenceKey) as? Bool ?? true) else { return false }
-        lastFollowRequest = request
-        followAudio = enabled
-        if enabled {
-            detached = false
-            if startID == nil { fromReading = false; resumeProgress = nil }
-        }
-        applyAudio()
-        return enabled
     }
 
     /// 同书现有音频直接切换播放意图；新起播才等待完整索引并重验用户导航代次。
     func primaryPlayback() {
         if ReaderProgressPolicy.shouldToggleExistingAudio(ownsAudio: ownsAudio,
-            wantsPlayback: playback.snapshot.wantsPlayback, isPreparing: playback.snapshot.isPreparing, fromReading: fromReading) {
+            wantsPlayback: playback.snapshot.wantsPlayback, fromReading: fromReading) {
             cancelStart(); playback.toggle(); applyAudio(); return
         }
         guard !fromReading, let progress = resumeProgress else { startFromVisible(); return }
@@ -251,7 +268,7 @@ final class ReaderSession: ObservableObject {
                 guard !Task.isCancelled, !closed, startID == request, revision == token else { return }
                 startID = nil; startTask = nil
                 guard ReaderProgressPolicy.canResumeAudio(progress: progress, book: indexed) else { startFromVisible(); return }
-                detached = false
+                audioNavigationDeferral = nil
                 playback.start(book: indexed, sentenceIndex: progress.sentenceIndex, offset: progress.audioOffset)
                 applyAudio()
             } catch { finishStartError(error, request: request) }
@@ -265,6 +282,7 @@ final class ReaderSession: ObservableObject {
         cancelStart()
         let request = UUID(), token = revision, chapter = chapterIndex
         startID = request
+        applyAudio()
         startTask = Task { [weak self] in
             guard let self else { return }
             // 先捕获点击时的 DOM，防止长书索引准备期间页面变动后误从新位置起播。
@@ -276,9 +294,11 @@ final class ReaderSession: ObservableObject {
                 guard let target, let index = ReaderProgressPolicy.sentenceIndex(book: indexed, chapterIndex: chapter,
                     sectionID: target.sectionID, textOffset: target.offset, startOfParagraph: !selection) else {
                     error = selection ? "未能定位选中的原文，请重新选择。" : "当前页面暂无可朗读文字，请从目录选择正文。"
+                    applyAudio()
                     return
                 }
-                fromReading = false; detached = false; resumeProgress = nil
+                audioNavigationDeferral = nil
+                fromReading = false; resumeProgress = nil
                 playback.start(book: indexed, sentenceIndex: index); applyAudio()
                 if selection, let webView { _ = try? await ReaderJavaScript.evaluate("window.FreeReading.clearSelection()", in: webView) }
             } catch { finishStartError(error, request: request) }
@@ -289,13 +309,15 @@ final class ReaderSession: ObservableObject {
         guard !closed, startID == request else { return }
         startID = nil; startTask = nil
         if !(failure is CancellationError) { error = failure.localizedDescription }
+        applyAudio()
     }
 
     func skipListeningChapter(forward: Bool) {
         let snapshot = playback.snapshot
         guard ownsAudio, (forward ? snapshot.canGoToNextChapter : snapshot.canGoToPreviousChapter) else { return }
         cancelStart(); revision += 1
-        fromReading = false; detached = false; resumeProgress = nil
+        audioNavigationDeferral = nil
+        fromReading = false; resumeProgress = nil
         if forward { playback.nextChapter() } else { playback.previousChapter() }
         applyAudio()
     }
@@ -377,7 +399,9 @@ final class ReaderSession: ObservableObject {
     private func setChapter(_ target: Int) {
         guard chapterIndex != target else { return }
         chapterIndex = target
-        ready = false; anchor = nil; pageProgress = 0; selectionActive = false; highlight = nil
+        // 手动切章与下一句可能在同一帧发生，回到 WebView 仍显示的章节时无需等重新加载。
+        ready = webView?.isLoading == false && webView?.url?.standardizedFileURL == chapterURL?.standardizedFileURL
+        anchor = nil; pageProgress = 0; selectionActive = false; highlight = nil
         navigation = nil; pendingNavigation = nil
     }
 
@@ -428,7 +452,8 @@ final class ReaderSession: ObservableObject {
             guard let candidate = try? repository.contentURL(bookID: book.record.id, href: chapter.href) else { return false }
             return candidate.standardizedFileURL.path == target.standardizedFileURL.path
         }) else { error = "链接未指向可阅读的正文资源。"; return }
-        markManualNavigation(); setChapter(index)
+        markManualNavigation()
+        setChapter(index)
         issueNavigation(components?.fragment.map(ReaderNavigation.Target.fragment) ?? .progress(0))
         applyAudio()
     }

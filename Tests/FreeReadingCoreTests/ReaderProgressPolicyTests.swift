@@ -87,6 +87,25 @@ final class ReaderProgressPolicyTests: XCTestCase {
         XCTAssertNil(ReaderProgressPolicy.readingProgress(book: book, chapterIndex: 50, sectionID: nil, textOffset: 0, pageProgress: 0))
     }
 
+    func testPlaybackButtonPausesActiveAudioAndRestartsAtTheNewLocationAfterBrowsingWhilePaused() {
+        XCTAssertTrue(ReaderProgressPolicy.shouldToggleExistingAudio(ownsAudio: true, wantsPlayback: true, fromReading: true))
+        XCTAssertFalse(ReaderProgressPolicy.shouldToggleExistingAudio(ownsAudio: true, wantsPlayback: false, fromReading: true))
+        XCTAssertTrue(ReaderProgressPolicy.shouldToggleExistingAudio(ownsAudio: true, wantsPlayback: false, fromReading: false))
+        XCTAssertFalse(ReaderProgressPolicy.shouldToggleExistingAudio(ownsAudio: false, wantsPlayback: true, fromReading: false))
+    }
+
+    func testManualPageStaysUntilTheNextSentenceActuallyPlays() {
+        let duringSpeech = ReaderAudioNavigationDeferral.readingSentence(6)
+        XCTAssertTrue(duringSpeech.shouldWait(wantsPlayback: true, isPlaying: true, sentenceIndex: 6))
+        XCTAssertTrue(duringSpeech.shouldWait(wantsPlayback: true, isPlaying: false, sentenceIndex: 7))
+        XCTAssertFalse(duringSpeech.shouldWait(wantsPlayback: true, isPlaying: true, sentenceIndex: 7))
+        XCTAssertFalse(duringSpeech.shouldWait(wantsPlayback: false, isPlaying: false, sentenceIndex: 6))
+
+        let duringPreparation = ReaderAudioNavigationDeferral.waitingForPlayback
+        XCTAssertTrue(duringPreparation.shouldWait(wantsPlayback: true, isPlaying: false, sentenceIndex: 7))
+        XCTAssertFalse(duringPreparation.shouldWait(wantsPlayback: true, isPlaying: true, sentenceIndex: 7))
+    }
+
     private func fixture() -> SpeechBook {
         let first = "第一句。", second = "第二😀句。"
         let start = first.utf16.count, end = (first + second).utf16.count

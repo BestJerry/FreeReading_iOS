@@ -2,6 +2,7 @@
     "use strict";
     if (window.FreeReading) return;
     var paged = true, rtl = false, lastHighlight = null, scrollTimer = null, touch = null, selectionTimer = null, navigationRevision = 0;
+    var highlightAtSwipe = null;
     // EPUB 常未声明移动端视口；否则 iOS 使用约 980px 的布局宽度，20px 正文会整体缩小。
     // XHTML 必须使用 HTML 命名空间创建 meta，且不限制用户放大手势。
     function ensureViewport() {
@@ -92,6 +93,10 @@
         }
         return {sectionID: Number(found.getAttribute("data-fr-section")), offset: low, progress: progress()};
     }
+    function hasSelection() {
+        var selected = getSelection();
+        return selected && !selected.isCollapsed;
+    }
     function selectionAnchor() {
         var selected = getSelection();
         if (!selected || selected.isCollapsed || !selected.rangeCount || !selected.toString().trim()) return null;
@@ -164,6 +169,11 @@
         }
         setTimeout(function () { post("anchor", anchor()); }, 40);
     }
+    function firstTextRect(range) {
+        return Array.from(range.getClientRects()).find(function (rect) {
+            return rect.width > 0 && rect.height > 0;
+        });
+    }
     function drawHighlight(target, move) {
         layer.replaceChildren();
         if (!target) return;
@@ -171,7 +181,7 @@
         if (!element) return;
         var range = textRange(element, target.start, target.end);
         if (!range) return;
-        if (move) { navigationRevision += 1; locate(range.getClientRects()[0] || range.getBoundingClientRect()); }
+        if (move) { navigationRevision += 1; locate(firstTextRect(range) || range.getBoundingClientRect()); }
         Array.from(range.getClientRects()).forEach(function (rect) {
             if (rect.width <= 0 || rect.height <= 0) return;
             var mark = document.createElement("div");
@@ -205,7 +215,15 @@
     }
     window.FreeReading = {
         anchor: anchor, selectionAnchor: selectionAnchor, contents: contents, configure: configure, navigate: navigate,
-        highlight: function (target) { lastHighlight = target; drawHighlight(target, !!(target && target.navigate)); },
+        highlight: function (target) {
+            // 手势消息还在去往 Swift 时，也拦住已进入 WebKit 的本句滚动请求。
+            var sameAsSwipe = target && highlightAtSwipe &&
+                target.sectionID === highlightAtSwipe.sectionID &&
+                target.start === highlightAtSwipe.start && target.end === highlightAtSwipe.end;
+            if (!(sameAsSwipe && target.navigate)) highlightAtSwipe = null;
+            lastHighlight = target;
+            drawHighlight(target, !!(target && target.navigate) && !sameAsSwipe && !hasSelection());
+        },
         clearSelection: function () { var selected = getSelection(); if (selected) selected.removeAllRanges(); }
     };
     document.addEventListener("click", function (event) {
@@ -214,7 +232,7 @@
             event.preventDefault(); event.stopPropagation();
             post("link", {href: link.getAttribute("href")}); return;
         }
-        if (getSelection() && !getSelection().isCollapsed) return;
+        if (hasSelection()) return;
         if (touch && (touch.moved || Date.now() - touch.time > 550)) return;
         event.preventDefault(); event.stopPropagation(); post("tap");
     }, true);
@@ -226,7 +244,12 @@
         if (!touch) return;
         var p = event.touches[0], dx = p.clientX - touch.x, dy = p.clientY - touch.y;
         if (!touch.moved && (Math.abs(dx) > 10 || (!paged && Math.abs(dy) > 10))) {
-            touch.moved = true; post("manual", {reason: "swipe"});
+            touch.moved = true;
+            if (lastHighlight && lastHighlight.navigate) {
+                highlightAtSwipe = lastHighlight;
+                touch.shownSentence = lastHighlight.sentenceIndex;
+            }
+            post("manual", {shownSentence: touch.shownSentence});
         }
     }, {passive: true});
     document.addEventListener("touchend", function (event) {
@@ -235,7 +258,7 @@
         if (Math.abs(dx) > 65 && Math.abs(dx) > Math.abs(dy) * 1.4) {
             var delta = (dx < 0 ? 1 : -1) * (rtl ? -1 : 1);
             if (!paged || (delta > 0 && touch.scroll >= maximumPosition() - 3) || (delta < 0 && touch.scroll <= 3)) {
-                post("chapter", {delta: delta});
+                post("chapter", {delta: delta, shownSentence: touch.shownSentence});
             }
         }
     }, {passive: true});
@@ -243,7 +266,6 @@
         clearTimeout(selectionTimer);
         selectionTimer = setTimeout(function () {
             var value = selectionAnchor();
-            if (value) post("manual", {reason: "selection"});
             post("selection", {active: !!value});
         }, 80);
     });

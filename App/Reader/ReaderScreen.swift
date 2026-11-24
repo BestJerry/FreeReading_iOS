@@ -16,7 +16,6 @@ struct ReaderScreen: View {
     @AppStorage("reader.fontSize") private var fontSize = 20.0
     @AppStorage("reader.theme") private var theme = "paper"
     @AppStorage("reader.scroll") private var scroll = false
-    @AppStorage(PlaybackFollowRequest.preferenceKey) private var followAudio = true
     @State private var sheet: ReaderSheet?
     @State private var playerPresented = false
     @State private var didOpen = false
@@ -35,15 +34,6 @@ struct ReaderScreen: View {
     private var appearance: ReaderAppearance { ReaderAppearance(fontSize: min(36, max(14, fontSize)), theme: theme, scroll: scroll, direction: book.readingDirection) }
     private var activeAudio: Bool { playback.snapshot.bookID == book.record.id && playback.book?.record.addedAt == book.record.addedAt }
     private var percent: Int { Int(min(1, max(0, session.readingFraction)) * 100) }
-    private var followingAudio: Bool { followAudio && !session.detached }
-    // 只在用户操作开关时恢复定位；播放器自动写偏好由独立起播事件处理。
-    private var followBinding: Binding<Bool> {
-        Binding(get: { followAudio }, set: { enabled in
-            followAudio = enabled
-            session.setFollow(enabled)
-        })
-    }
-
     var body: some View {
         ZStack(alignment: .top) {
             colors.paper.ignoresSafeArea()
@@ -95,26 +85,25 @@ struct ReaderScreen: View {
                 .presentationDetents([.medium, .large]).presentationDragIndicator(.visible)
                 .presentationBackground(colors.paper)
             case .settings:
-                ReaderSettingsSheet(fontSize: $fontSize, theme: $theme, scroll: $scroll, followAudio: followBinding)
+                ReaderSettingsSheet(fontSize: $fontSize, theme: $theme, scroll: $scroll)
                     .presentationDetents([.medium, .large]).presentationDragIndicator(.visible)
                     .presentationBackground(colors.paper)
             }
         }
         .fullScreenCover(isPresented: $playerPresented, onDismiss: { session.applyAudio() }) {
             ListeningScreen(book: book, repository: repository, theme: theme, readingReady: session.ready, playback: playback,
-                followAudio: followBinding, detached: session.detached, isLoadingSpeech: session.isLoadingSpeech,
+                isLoadingSpeech: session.isLoadingSpeech,
                 onMainAction: session.primaryPlayback, onFromReading: session.startFromVisible,
                 onPreviousChapter: { session.skipListeningChapter(forward: false) },
                 onNextChapter: { session.skipListeningChapter(forward: true) },
-                onResumeFollow: session.resumeFollowing, onStop: { session.endListening(); playerPresented = false })
+                onLocate: session.locateCurrentAudio, onStop: { session.endListening(); playerPresented = false })
         }
         .alert("操作未完成", isPresented: Binding(get: { session.error != nil }, set: { if !$0 { session.error = nil } })) {
             Button("知道了", role: .cancel) { session.error = nil }
         } message: { Text(session.error ?? "") }
         .task {
             // 返回原文仍恢复可接收事件的会话；只在首次打开时自动进入播放器。
-            session.open(follow: followAudio)
-            session.followNewPlaybackStart()
+            session.open()
             if !didOpen {
                 didOpen = true
                 if openPlayer { playerPresented = true }
@@ -124,10 +113,9 @@ struct ReaderScreen: View {
         .onDisappear { session.saveNow() }
         .onChange(of: playback.snapshot.bookID) { _, _ in session.applyAudio() }
         .onChange(of: playback.snapshot.sentenceIndex) { _, _ in session.applyAudio() }
-        .onChange(of: playback.snapshot.isPlaying) { _, _ in session.applyAudio() }
-        .onChange(of: followAudio) { _, value in session.synchronizeFollowPreference(value) }
-        .onChange(of: playback.snapshot.followRequest) { _, _ in
-            session.followNewPlaybackStart()
+        .onChange(of: playback.snapshot.wantsPlayback) { _, _ in session.applyAudio() }
+        .onChange(of: playback.snapshot.isPlaying) { _, playing in
+            if playing { session.audioDidStartPlaying() }
         }
         .onChange(of: scenePhase) { _, phase in
             if phase == .active { session.applyAudio() } else { session.saveNow() }
@@ -207,17 +195,6 @@ struct ReaderScreen: View {
             .accessibilityLabel(session.menuVisible ? "收起阅读工具" : "显示阅读工具")
             .accessibilityIdentifier("reader_controls_toggle")
             if activeAudio {
-                Button {
-                    if followAudio && session.detached { session.resumeFollowing() }
-                    else { followBinding.wrappedValue = !followAudio }
-                } label: {
-                    Text(followingAudio ? "自动翻页" : "继续跟随")
-                        .font(.system(size: 11)).lineLimit(1).fixedSize(horizontal: true, vertical: false)
-                        .frame(height: 28).contentShape(Rectangle())
-                }
-                .buttonStyle(.plain).foregroundStyle(colors.accent)
-                .accessibilityLabel(followingAudio ? "暂停自动翻页" : "跟随朗读自动翻页")
-                .accessibilityIdentifier("reader_audio_follow")
                 if !session.menuVisible {
                     Button { playerPresented = true } label: {
                         HStack(spacing: 4) {
@@ -292,7 +269,6 @@ private struct ReaderSettingsSheet: View {
     @Binding var fontSize: Double
     @Binding var theme: String
     @Binding var scroll: Bool
-    @Binding var followAudio: Bool
     @Environment(\.dismiss) private var dismiss
     private var colors: ReadingColors { ReadingColors(theme: theme) }
 
@@ -323,9 +299,6 @@ private struct ReaderSettingsSheet: View {
                             Text("关闭时左右翻页").font(.system(size: 11)).foregroundStyle(colors.muted)
                         }
                     }.tint(colors.accent).accessibilityIdentifier("reader_scroll_toggle")
-                    Toggle(isOn: $followAudio) {
-                        Text("听书时自动翻页").font(.system(size: 14))
-                    }.tint(colors.accent).accessibilityIdentifier("reader_follow_toggle")
                 }
                 .frame(maxWidth: 520).padding(.horizontal, 24).padding(.bottom, 28)
                 .frame(maxWidth: .infinity)

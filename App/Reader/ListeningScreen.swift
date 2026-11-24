@@ -10,14 +10,12 @@ struct ListeningScreen: View {
     var theme: String = "paper"
     var readingReady: Bool = true
     @ObservedObject var playback: PlaybackController
-    @Binding var followAudio: Bool
-    let detached: Bool
     let isLoadingSpeech: Bool
     let onMainAction: () -> Void
     let onFromReading: () -> Void
     let onPreviousChapter: () -> Void
     let onNextChapter: () -> Void
-    let onResumeFollow: () -> Void
+    let onLocate: () -> Void
     let onStop: () -> Void
     @Environment(\.dismiss) private var dismiss
     @ScaledMetric(relativeTo: .body) private var textScale: CGFloat = 1
@@ -78,7 +76,6 @@ struct ListeningScreen: View {
                             .font(.system(size: 11 * textScale)).foregroundStyle(colors.muted)
                             .multilineTextAlignment(.center)
                     }
-                    followControl.padding(.top, 18)
                     readingControls.padding(.top, 12)
                     if active, let message = snapshot.error {
                         Text(message).font(.system(size: 13 * textScale)).lineSpacing(5)
@@ -230,25 +227,10 @@ struct ListeningScreen: View {
         }.font(.system(size: 13 * textScale)).foregroundStyle(colors.accent)
     }
 
-    private var followControl: some View {
-        Toggle(isOn: $followAudio) {
-            VStack(alignment: .leading, spacing: 4) {
-                Text("跟随原文").font(.system(size: 14 * textScale))
-                Text(active && detached ? "已暂停跟随，可定位当前朗读句" : "朗读时自动定位正文")
-                    .font(.system(size: 11 * textScale)).foregroundStyle(colors.muted)
-            }
-        }
-        .disabled(!active || !readingReady).tint(colors.accent)
-        .padding(.horizontal, 16).padding(.vertical, 12)
-        .background(colors.ink.opacity(0.035), in: RoundedRectangle(cornerRadius: 16))
-        .accessibilityIdentifier("listening-follow")
-    }
-
     private var readingControls: some View {
         HStack(spacing: 10) {
             Button {
-                followAudio = true
-                onResumeFollow()
+                onLocate()
                 dismiss()
             } label: {
                 Label("定位原文", systemImage: "scope").frame(maxWidth: .infinity)

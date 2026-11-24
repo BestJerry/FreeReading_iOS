@@ -46,7 +46,7 @@ final class ReaderBridgeWebKitTests: XCTestCase {
             let value = try await web.readerTestJavaScript("""
                 window.FreeReading.configure({fontSize:22,paper:'#fff',ink:'#222',scroll:false,direction:direction});
                 window.FreeReading.navigate({kind:'section',sectionID:28,offset:start});
-                window.FreeReading.highlight({sectionID:28,start:start,end:end,navigate:true});
+                window.FreeReading.highlight({sectionID:28,start:start,end:end,navigate:true,sentenceIndex:412});
                 await new Promise(resolve => setTimeout(resolve, 80));
                 const marks = Array.from(document.getElementById('fr-highlight-layer').children);
                 const visible = marks.some(mark => { const r=mark.getBoundingClientRect(); return r.width>0 && r.height>0 && r.right>0 && r.left<innerWidth && r.bottom>0 && r.top<innerHeight; });
@@ -63,6 +63,47 @@ final class ReaderBridgeWebKitTests: XCTestCase {
             let saved = try XCTUnwrap(state["anchor"] as? [String: Any])
             let savedSection = try XCTUnwrap(saved["sectionID"] as? NSNumber).intValue
             let savedOffset = try XCTUnwrap(saved["offset"] as? NSNumber).intValue
+
+            messages.manualSentences.removeAll()
+            let afterManualPageChange = try await web.readerTestJavaScript("""
+                for (const [type, x] of [['touchstart', 180], ['touchmove', 60]]) {
+                    const event = new Event(type, {bubbles: true});
+                    Object.defineProperty(event, 'touches', {value: [{clientX: x, clientY: 200}]});
+                    document.dispatchEvent(event);
+                }
+                scrollTo({left: 0, top: 0, behavior: 'instant'});
+                window.FreeReading.highlight({sectionID:28,start:start,end:end,navigate:true});
+                await new Promise(resolve => setTimeout(resolve, 420));
+                const whilePlaying = Math.abs(scrollX);
+                window.FreeReading.highlight({sectionID:28,start:start,end:end,navigate:false});
+                const afterSameSentenceUpdate = Math.abs(scrollX);
+                window.FreeReading.highlight({sectionID:29,start:start,end:end,navigate:true});
+                const afterNextSentence = Math.abs(scrollX);
+                window.FreeReading.highlight({sectionID:29,start:start,end:end,navigate:false});
+                window.FreeReading.navigate({kind:'progress',value:0});
+                await new Promise(resolve => setTimeout(resolve, 420));
+                const whilePaused = Math.abs(scrollX);
+                const selection = getSelection();
+                const text = document.querySelector('[data-fr-section="0"]').firstChild;
+                const range = document.createRange();
+                range.setStart(text, 0); range.setEnd(text, 3);
+                selection.addRange(range);
+                window.FreeReading.highlight({sectionID:28,start:start,end:end,navigate:true});
+                const whileSelecting = Math.abs(scrollX);
+                selection.removeAllRanges();
+                return {whilePlaying, afterSameSentenceUpdate, afterNextSentence, whilePaused, whileSelecting};
+                """, arguments: ["start": start, "end": end], in: nil, contentWorld: .page)
+            let manualPage = try XCTUnwrap(afterManualPageChange as? [String: Any])
+            XCTAssertEqual(messages.manualSentences, [412], "\(direction) 手势应报告触发时页面上对应的朗读句。")
+            XCTAssertEqual((manualPage["whilePlaying"] as? NSNumber)?.doubleValue ?? -1, 0, accuracy: 1,
+                "\(direction) 当前句仍在朗读时，手动翻页后应留在新页面。")
+            XCTAssertEqual((manualPage["afterSameSentenceUpdate"] as? NSNumber)?.doubleValue ?? -1, 0, accuracy: 1)
+            XCTAssertGreaterThan((manualPage["afterNextSentence"] as? NSNumber)?.doubleValue ?? 0, 360,
+                "\(direction) 开始朗读下一句时应恢复定位。")
+            XCTAssertEqual((manualPage["whilePaused"] as? NSNumber)?.doubleValue ?? -1, 0, accuracy: 1,
+                "\(direction) 暂停后可自由翻页。")
+            XCTAssertEqual((manualPage["whileSelecting"] as? NSNumber)?.doubleValue ?? -1, 0, accuracy: 1,
+                "\(direction) 朗读更新不能在选文时移走正在选择的文字。")
 
             // 用真实 DOM 游标模拟离页重开；调大字号、切滚动后恢复的字符仍应可见。
             let restored = try await web.readerTestJavaScript("""
@@ -272,10 +313,12 @@ private final class ReaderTestJavaScriptResult {
 @MainActor
 private final class ReaderTestMessages: NSObject, WKScriptMessageHandler {
     var chapters: [Int] = []
+    var manualSentences: [Int] = []
     func userContentController(_ userContentController: WKUserContentController, didReceive message: WKScriptMessage) {
-        guard let body = message.body as? [String: Any], body["type"] as? String == "chapter",
-              let value = body["value"] as? [String: Any], let delta = value["delta"] as? Int else { return }
-        chapters.append(delta)
+        guard let body = message.body as? [String: Any], let type = body["type"] as? String,
+              let value = body["value"] as? [String: Any] else { return }
+        if type == "chapter", let delta = value["delta"] as? Int { chapters.append(delta) }
+        if type == "manual", let sentence = value["shownSentence"] as? Int { manualSentences.append(sentence) }
     }
 }
 
