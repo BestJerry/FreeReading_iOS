@@ -15,7 +15,7 @@ final class ShareViewController: UIViewController {
         view.backgroundColor = .systemBackground
         let title = UILabel()
         title.text = "导入 FreeReading"; title.font = .preferredFont(forTextStyle: .title2)
-        status.text = "正在复制 EPUB…"; status.numberOfLines = 0
+        status.text = "正在复制书籍…"; status.numberOfLines = 0
         let close = UIButton(type: .system)
         close.setTitle("关闭", for: .normal)
         close.addTarget(self, action: #selector(closeExtension), for: .touchUpInside)
@@ -42,14 +42,18 @@ final class ShareViewController: UIViewController {
             show("无法访问共享书库。请确认主应用和分享扩展配置了相同的 App Group。"); return
         }
         let providers = (extensionContext?.inputItems as? [NSExtensionItem] ?? []).flatMap { $0.attachments ?? [] }
-        let epubType = "org.idpf.epub-container"
-        guard let provider = providers.first(where: { $0.hasItemConformingToTypeIdentifier(epubType) })
-                ?? providers.first(where: { $0.hasItemConformingToTypeIdentifier(UTType.fileURL.identifier) }) else {
-            show("未找到 EPUB 文件。也可以在 FreeReading 中从“文件”导入。"); return
+        let supported: [(BookFormat, UTType)] = [(.epub, .epub), (.pdf, .pdf)]
+        let match = providers.lazy.compactMap { provider in
+            supported.first(where: { provider.hasItemConformingToTypeIdentifier($0.1.identifier) }).map { (provider, $0.0, $0.1) }
+        }.first
+        guard let provider = match?.0 ?? providers.first(where: {
+            $0.hasItemConformingToTypeIdentifier(UTType.fileURL.identifier)
+        }) else {
+            show("未找到 EPUB 或 PDF 文件。也可以在 FreeReading 中从“文件”导入。"); return
         }
         let inbox = ShareInbox(root: container.appendingPathComponent("EPUBInbox", isDirectory: true))
         let token = cancellation
-        let declaredEPUB = provider.hasItemConformingToTypeIdentifier(epubType)
+        let declaredFormat = match?.1
         let suggestedName = provider.suggestedName
         let completion: @Sendable (URL?, Error?) -> Void = { [weak self] url, error in
             do {
@@ -57,15 +61,17 @@ final class ShareViewController: UIViewController {
                 let scoped = url.startAccessingSecurityScopedResource()
                 defer { if scoped { url.stopAccessingSecurityScopedResource() } }
                 var name = suggestedName ?? url.lastPathComponent
-                // 部分提供方的临时 URL 没有扩展名，按其明确声明的 EPUB 类型保留文件名。
-                if declaredEPUB, (name as NSString).pathExtension.lowercased() != "epub" { name += ".epub" }
+                // 部分提供方的临时 URL 没有扩展名，按其明确声明的类型保留文件名。
+                if let declaredFormat, (name as NSString).pathExtension.lowercased() != declaredFormat.rawValue {
+                    name += "." + declaredFormat.rawValue
+                }
                 try inbox.enqueue(from: url, displayName: name, cancelled: { token.isCancelled })
-                Task { @MainActor [weak self] in self?.show("已接收 EPUB。请打开 FreeReading，继续导入书架。") }
+                Task { @MainActor [weak self] in self?.show("已接收书籍。请打开 FreeReading，继续导入书架。") }
             } catch is CancellationError { }
             catch { Task { @MainActor [weak self] in self?.show(error.localizedDescription) } }
         }
-        if provider.hasItemConformingToTypeIdentifier(epubType) {
-            providerProgress = provider.loadFileRepresentation(forTypeIdentifier: epubType, completionHandler: completion)
+        if let type = match?.2 {
+            providerProgress = provider.loadFileRepresentation(forTypeIdentifier: type.identifier, completionHandler: completion)
         } else {
             provider.loadItem(forTypeIdentifier: UTType.fileURL.identifier, options: nil) { item, error in
                 completion(item as? URL, error)

@@ -3,6 +3,7 @@ import Combine
 import FreeReadingCore
 
 struct ReadingRoute: Identifiable {
+    let sessionID = UUID()
     let bootstrap: ReadingBookBootstrap
     let openPlayer: Bool
     var id: String { bootstrap.book.record.id }
@@ -30,7 +31,7 @@ final class AppStore: ObservableObject {
     init(repository: BookRepository) {
         self.repository = repository
         playback = PlaybackController(repository: repository)
-        imports = ImportCoordinator { url, progress in try await repository.importEPUB(from: url, progress: progress) }
+        imports = ImportCoordinator { url, progress in try await repository.importDocument(from: url, progress: progress) }
         let group = Bundle.main.object(forInfoDictionaryKey: "FreeReadingAppGroup") as? String
         shareInbox = group.flatMap { FileManager.default.containerURL(forSecurityApplicationGroupIdentifier: $0) }
             .map { ShareInbox(root: $0.appendingPathComponent("EPUBInbox", isDirectory: true)) }
@@ -91,7 +92,7 @@ final class AppStore: ObservableObject {
         guard !busy, !importState.canRetry, route == nil, sharedSources.isEmpty, let shareInbox else { return }
         do {
             let item = try shareInbox.claimNext { [weak self] _ in
-                self?.errorMessage = "有一份分享文件已损坏，已隔离保存。请重新分享该 EPUB。"
+                self?.errorMessage = "有一份分享文件已损坏，已隔离保存。请重新分享该书籍文件。"
             }
             if let item {
                 sharedSources.insert(item.fileURL)

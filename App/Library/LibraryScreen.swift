@@ -66,7 +66,7 @@ struct LibraryScreen: View {
         .task { await store.refresh(); store.consumeShareInbox() }
         .fileImporter(
             isPresented: $importing,
-            allowedContentTypes: [UTType(filenameExtension: "epub") ?? .data],
+            allowedContentTypes: [.epub, .pdf],
             allowsMultipleSelection: false
         ) { result in
             switch result {
@@ -75,10 +75,16 @@ struct LibraryScreen: View {
             }
         }
         .fullScreenCover(item: $store.route, onDismiss: store.consumeShareInbox) { route in
-            ReaderScreen(
-                bootstrap: route.bootstrap, repository: store.repository,
-                playback: store.playback, openPlayer: route.openPlayer
-            )
+            Group {
+                if route.bootstrap.book.record.format == .pdf {
+                    PDFReaderScreen(bootstrap: route.bootstrap, repository: store.repository,
+                        playback: store.playback, openPlayer: route.openPlayer,
+                        isRouteActive: { store.route?.sessionID == route.sessionID })
+                } else {
+                    ReaderScreen(bootstrap: route.bootstrap, repository: store.repository,
+                        playback: store.playback, openPlayer: route.openPlayer)
+                }
+            }
             .id(route.id)
         }
         .alert("语音设置", isPresented: $voiceSettings) {
@@ -145,7 +151,7 @@ struct LibraryScreen: View {
         Button { importing = true } label: {
             HStack(spacing: 6) {
                 Image(systemName: "plus").font(.system(size: 18))
-                Text(store.importState.isImporting ? "重新选择 EPUB" : "导入 EPUB")
+                Text(store.importState.isImporting ? "重新选择文件" : "导入书籍")
                     .font(.caption.weight(.medium))
                     .fixedSize(horizontal: true, vertical: false)
             }
@@ -267,7 +273,7 @@ private struct EmptyLibrary: View {
                 .foregroundStyle(LibraryTheme.ink)
                 .multilineTextAlignment(.center)
                 .fixedSize(horizontal: false, vertical: true)
-            Text("导入本地 EPUB，随时阅读，也能闭上眼睛听。")
+            Text("导入本地 EPUB 或 PDF，随时阅读和听书。")
                 .font(.subheadline).lineSpacing(3)
                 .foregroundStyle(LibraryTheme.muted)
                 .multilineTextAlignment(.center)
@@ -275,7 +281,7 @@ private struct EmptyLibrary: View {
             Button(action: openImporter) {
                 HStack(spacing: 8) {
                     Image(systemName: "plus").font(.system(size: 20))
-                    Text(isImporting ? "重新选择 EPUB" : "导入 EPUB")
+                    Text(isImporting ? "重新选择文件" : "导入书籍")
                         .font(.subheadline.weight(.medium))
                 }
                 .foregroundStyle(.white)
@@ -368,7 +374,9 @@ private struct BookLibraryRow: View {
             .accessibilityIdentifier("library.book.\(book.id)")
             Menu {
                 Button("打开阅读", systemImage: "book", action: open)
-                Button("打开听书", systemImage: "headphones", action: openListening)
+                if book.format != .pdf || book.sentenceCount > 0 {
+                    Button("打开听书", systemImage: "headphones", action: openListening)
+                }
                 Button("移除书籍", systemImage: "trash", role: .destructive, action: remove)
             } label: {
                 Image(systemName: "ellipsis")

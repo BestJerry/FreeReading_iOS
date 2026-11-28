@@ -16,6 +16,9 @@ enum BookIndexIO {
         var peakBufferedBytes: Int
     }
     static let catalogLimit = 32 * 1024 * 1024
+    private static let lineReadChunkBytes = 64 * 1024
+    // 旧版最多接受 12 MiB 待续字节加一个读取块内换行前的字节，保留这一上限。
+    static let lineByteLimit = 12 * 1024 * 1024 + lineReadChunkBytes - 1
 
     static func write(_ book: SpeechBook, directory: URL) throws {
         try Task.checkCancellation()
@@ -33,7 +36,8 @@ enum BookIndexIO {
         if try size(index) <= 16 * 1024,
            let header = try? readJSON(Header.self, from: index, limit: 16 * 1024) {
             guard header.version == 2, header.sections == "sections.jsonl", header.sentences == "sentences.jsonl",
-                  header.sectionCount > 0, header.sectionCount <= BookLimits.sentences,
+                  header.sectionCount >= (metadata.format == .pdf && metadata.sentenceCount == 0 ? 0 : 1),
+                  header.sectionCount <= BookLimits.sentences,
                   header.sentenceCount == metadata.sentenceCount else { throw BookError.invalid("听书索引版本或计数损坏") }
             let reading = try readJSON(ReadingBook.self, from: directory.appendingPathComponent("reading.json"), limit: catalogLimit)
             let sectionFile = directory.appendingPathComponent(header.sections)
@@ -120,6 +124,7 @@ enum BookIndexIO {
         for value in values {
             try Task.checkCancellation()
             var data = try encoder.encode(value)
+            guard data.count <= lineByteLimit else { throw BookError.invalid("听书索引单项过大") }
             data.append(10)
             guard data.count <= BookLimits.indexBytes - total else { throw BookError.invalid("书籍索引超过可支持容量") }
             total += data.count
@@ -147,18 +152,23 @@ enum BookIndexIO {
         var pending = Data()
         var peak = 0
         let decoder = JSONDecoder()
-        while let chunk = try input.read(upToCount: 64 * 1024), !chunk.isEmpty {
+        while let chunk = try input.read(upToCount: lineReadChunkBytes), !chunk.isEmpty {
             try Task.checkCancellation()
+            let bufferedBytes = pending.count
             pending.append(chunk)
             peak = max(peak, pending.count)
             var start = pending.startIndex
-            while let end = pending[start...].firstIndex(of: 10) {
+            // 先前保留的半行已经检查过，只在新读入的数据中找换行。
+            var searchStart = start + bufferedBytes
+            while let end = pending[searchStart...].firstIndex(of: 10) {
                 guard values.count < count, end > start else { throw BookError.invalid("听书索引行数损坏") }
+                guard end - start <= lineByteLimit else { throw BookError.invalid("听书索引单项过大") }
                 values.append(try decoder.decode(type, from: pending[start..<end]))
                 start = end + 1
+                searchStart = start
             }
             if start > pending.startIndex { pending.removeSubrange(pending.startIndex..<start) }
-            guard pending.count <= 12 * 1024 * 1024 else { throw BookError.invalid("听书索引单项过大") }
+            guard pending.count <= lineByteLimit else { throw BookError.invalid("听书索引单项过大") }
         }
         guard pending.isEmpty, values.count == count else { throw BookError.invalid("听书索引不完整") }
         return (values, peak)

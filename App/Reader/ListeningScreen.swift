@@ -130,7 +130,7 @@ struct ListeningScreen: View {
     private var chapterProgress: some View {
         VStack(spacing: 9) {
             HStack {
-                Text("本章进度").foregroundStyle(colors.muted)
+                Text(book.record.format == .pdf ? "本页进度" : "本章进度").foregroundStyle(colors.muted)
                 Spacer()
                 Text(active ? "\(Int(fraction * 100))%" : "—").monospacedDigit()
             }.font(.system(size: 12 * textScale))
@@ -191,12 +191,12 @@ struct ListeningScreen: View {
     private var chapterControls: some View {
         HStack(spacing: 12) {
             Button(action: onPreviousChapter) {
-                Label("上一章", systemImage: "backward.end.fill").frame(maxWidth: .infinity)
+                Label(book.record.format == .pdf ? "上一朗读页" : "上一章", systemImage: "backward.end.fill").frame(maxWidth: .infinity)
             }
             .disabled(!active || !snapshot.canGoToPreviousChapter)
             .accessibilityIdentifier("listening-previous-chapter")
             Button(action: onNextChapter) {
-                Label("下一章", systemImage: "forward.end.fill").frame(maxWidth: .infinity)
+                Label(book.record.format == .pdf ? "下一朗读页" : "下一章", systemImage: "forward.end.fill").frame(maxWidth: .infinity)
             }
             .disabled(!active || !snapshot.canGoToNextChapter)
             .accessibilityIdentifier("listening-next-chapter")

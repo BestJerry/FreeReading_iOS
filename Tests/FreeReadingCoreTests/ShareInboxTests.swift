@@ -89,4 +89,40 @@ final class ShareInboxTests: XCTestCase {
         try inbox.enqueue(from: source, displayName: "原创.epub")
         XCTAssertEqual(try inbox.claimNext()?.displayName, "原创.epub")
     }
+
+    func testPDFProviderCanPreserveTheNameOfATemporaryFileAndFinishAfterRestart() throws {
+        let root = try temporary()
+        let source = root.appendingPathComponent("provider-temporary-file")
+        let contents = Data("PDF fixture bytes".utf8)
+        try contents.write(to: source)
+        let inbox = ShareInbox(root: root.appendingPathComponent("inbox"))
+        let id = try inbox.enqueue(from: source, displayName: "原书名.PDF")
+        let item = try XCTUnwrap(inbox.claimNext())
+        XCTAssertEqual(item.id, id)
+        XCTAssertEqual(item.fileURL.lastPathComponent, "原书名.pdf")
+        XCTAssertEqual(try Data(contentsOf: item.fileURL), contents)
+        let reopened = ShareInbox(root: inbox.root)
+        XCTAssertEqual(try reopened.claimNext(), item)
+        XCTAssertThrowsError(try reopened.finish(fileURL: item.fileURL.deletingLastPathComponent().appendingPathComponent("other.pdf")))
+        try reopened.finish(fileURL: item.fileURL)
+        XCTAssertNil(try reopened.claimNext())
+    }
+
+    func testLegacyPendingEPUBWithoutFormatCanBeClaimed() throws {
+        let root = try temporary()
+        let inbox = ShareInbox(root: root.appendingPathComponent("inbox"))
+        let id = UUID()
+        let itemDirectory = inbox.root.appendingPathComponent("pending/" + id.uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(at: itemDirectory, withIntermediateDirectories: true)
+        let manifest = try JSONSerialization.data(withJSONObject: ["id": id.uuidString, "displayName": "旧书.epub", "createdAt": 1])
+        try manifest.write(to: itemDirectory.appendingPathComponent("request.json"))
+        let bytes = Data([1, 2, 3])
+        try bytes.write(to: itemDirectory.appendingPathComponent("book.epub"))
+
+        let item = try XCTUnwrap(inbox.claimNext())
+        XCTAssertEqual(item.id, id)
+        XCTAssertEqual(item.displayName, "旧书.epub")
+        XCTAssertEqual(try Data(contentsOf: item.fileURL), bytes)
+        try inbox.finish(fileURL: item.fileURL)
+    }
 }

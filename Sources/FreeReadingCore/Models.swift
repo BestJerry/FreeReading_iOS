@@ -1,9 +1,28 @@
 import Foundation
+import UniformTypeIdentifiers
 
 /// EPUB 的页面前进方向；旧书未保存此字段时沿用从左向右的阅读方式。
 public enum ReadingDirection: String, Codable, Sendable { case leftToRight, rightToLeft }
 
-/// 书架元数据；书籍 ID 使用原 EPUB 的 SHA-256，原文件移走后仍可独立阅读。
+/// 书库支持的本地文档格式。
+public enum BookFormat: String, Codable, Sendable {
+    case epub, pdf
+
+    public init?(fileURL: URL) {
+        guard fileURL.isFileURL else { return nil }
+        if let format = Self(rawValue: fileURL.pathExtension.lowercased()) {
+            self = format
+        } else if let type = try? fileURL.resourceValues(forKeys: [.contentTypeKey]).contentType {
+            if type.conforms(to: .pdf) { self = .pdf }
+            else if type.conforms(to: .epub) { self = .epub }
+            else { return nil }
+        } else { return nil }
+    }
+
+    var storedFileName: String { "book." + rawValue }
+}
+
+/// 书架元数据；书籍 ID 使用原文件的 SHA-256，旧书没有格式字段时视为 EPUB。
 public struct BookRecord: Codable, Identifiable, Equatable, Sendable {
     public var id: String
     public var title: String
@@ -14,12 +33,13 @@ public struct BookRecord: Codable, Identifiable, Equatable, Sendable {
     public var chapterCount: Int
     public var sentenceCount: Int
     public var readingDirection: ReadingDirection?
+    public var format: BookFormat?
 
-    public init(id: String, title: String, author: String = "", language: String = "zh-CN", addedAt: Date = Date(), coverPath: String? = nil, chapterCount: Int = 0, sentenceCount: Int = 0, readingDirection: ReadingDirection? = nil) {
+    public init(id: String, title: String, author: String = "", language: String = "zh-CN", addedAt: Date = Date(), coverPath: String? = nil, chapterCount: Int = 0, sentenceCount: Int = 0, readingDirection: ReadingDirection? = nil, format: BookFormat? = nil) {
         self.id = id; self.title = title; self.author = author; self.language = language
         self.addedAt = addedAt; self.coverPath = coverPath
         self.chapterCount = chapterCount; self.sentenceCount = sentenceCount
-        self.readingDirection = readingDirection
+        self.readingDirection = readingDirection; self.format = format
     }
 }
 
@@ -47,12 +67,13 @@ public struct ReadingBookBootstrap: Equatable, Sendable {
     public var book: ReadingBook
     public var progress: ReadingProgress?
     public var cachedSpeechBook: SpeechBook?
-    public init(book: ReadingBook, progress: ReadingProgress? = nil, cachedSpeechBook: SpeechBook? = nil) {
-        self.book = book; self.progress = progress; self.cachedSpeechBook = cachedSpeechBook
+    public var pdfPage: Int?
+    public init(book: ReadingBook, progress: ReadingProgress? = nil, cachedSpeechBook: SpeechBook? = nil, pdfPage: Int? = nil) {
+        self.book = book; self.progress = progress; self.cachedSpeechBook = cachedSpeechBook; self.pdfPage = pdfPage
     }
 }
 
-/// EPUB spine 的一个正文资源；章节控制与章节进度共用该边界。
+/// EPUB 的正文资源或 PDF 的一页；章节控制与章节进度共用该边界。
 public struct BookChapter: Codable, Identifiable, Equatable, Sendable {
     public var id: Int
     public var href: String
@@ -71,7 +92,7 @@ public struct BookSection: Codable, Identifiable, Equatable, Sendable {
     }
 }
 
-/// 与 DOM Range 对应的 UTF-16 偏移，结束位置不包含在范围内。
+/// 正文中的 UTF-16 偏移，结束位置不包含在范围内。
 public struct TextRange: Codable, Equatable, Sendable {
     public var start: Int
     public var end: Int
